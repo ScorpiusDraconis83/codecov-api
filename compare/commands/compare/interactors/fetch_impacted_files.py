@@ -1,12 +1,12 @@
 import enum
 from typing import List, Optional
 
-from shared.utils.match import match
+from shared.utils.match import Matcher
 
 import services.components as components
 from codecov.commands.base import BaseInteractor
 from services.comparison import Comparison, ComparisonReport, ImpactedFile
-from services.report import files_belonging_to_flags, files_in_sessions
+from services.report import files_belonging_to_flags
 
 
 class ImpactedFileParameter(enum.Enum):
@@ -45,7 +45,7 @@ class FetchImpactedFiles(BaseInteractor):
             all_components = components.commit_components(
                 comparison.head_commit, comparison.user
             )
-            filtered_components = components.filter_components_by_name(
+            filtered_components = components.filter_components_by_name_or_id(
                 all_components, components_filter
             )
             for component in filtered_components:
@@ -74,11 +74,8 @@ class FetchImpactedFiles(BaseInteractor):
         res = impacted_files
 
         if components_paths:
-            res = [
-                file
-                for file in impacted_files
-                if match(components_paths, file.head_name)
-            ]
+            matcher = Matcher(components_paths)
+            res = [file for file in impacted_files if matcher.match(file.head_name)]
         return res
 
     def get_attribute(

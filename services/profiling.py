@@ -1,22 +1,22 @@
 import json
 import logging
-import re
 from typing import List, Optional
 
+import regex
+import shared.reports.api_report_service as report_service
 from django.utils.functional import cached_property
+from shared.api_archive.archive import ArchiveService
 from shared.profiling import ProfilingSummaryDataAnalyzer
 from shared.yaml import UserYaml
 
-import services.report as report_service
 from core.models import Commit, Repository
 from profiling.models import ProfilingCommit
-from services.archive import ArchiveService
 
 log = logging.getLogger(__name__)
 
 
 class CriticalFile:
-    def __init__(self, name):
+    def __init__(self, name: str) -> None:
         self.name = name
 
 
@@ -53,14 +53,14 @@ class ProfilingSummary:
         try:
             data = archive_service.read_file(profiling_commit.summarized_location)
             return ProfilingSummaryDataAnalyzer(json.loads(data))
-        except:
+        except Exception:
             log.error(
                 "failed to read summarized profiling data from storage", exc_info=True
             )
             return None
 
     def _get_critical_files_from_yaml(
-        self, profiling_commit: ProfilingCommit = None
+        self, profiling_commit: Optional[ProfilingCommit] = None
     ) -> List[str]:
         """
         Get a list of files present in the commit report that are also marked as critical in the repo yaml (under profiling.critical_files_paths)
@@ -79,17 +79,28 @@ class ProfilingSummary:
             "critical_files_paths"
         ):
             return []
-        commit_sha = self.commit_sha or profiling_commit.commit_sha
+
+        commit_sha = None
+        if self.commit_sha:
+            commit_sha = self.commit_sha
+        elif profiling_commit:
+            commit_sha = profiling_commit.commit_sha
+
         commit = Commit.objects.get(commitid=commit_sha)
         report = report_service.build_report_from_commit(commit)
         if report is None:
             return []
         critical_files_paths = repo_yaml["profiling"]["critical_files_paths"]
-        compiled_files_paths = [re.compile(path) for path in critical_files_paths]
+        compiled_files_paths = [regex.compile(path) for path in critical_files_paths]
         user_defined_critical_files = [
             file
             for file in report.files
-            if any(map(lambda regex: regex.match(file), compiled_files_paths))
+            if any(
+                (
+                    regex.match(regex_patt, file, timeout=2)
+                    for regex_patt in compiled_files_paths
+                )
+            )
         ]
         return user_defined_critical_files
 
@@ -122,4 +133,4 @@ class ProfilingSummary:
 
     @cached_property
     def critical_filenames(self) -> set[str]:
-        return set([file.name for file in self.critical_files])
+        return {file.name for file in self.critical_files}

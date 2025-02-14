@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timedelta
 
 import requests
 from django.conf import settings
@@ -12,7 +11,6 @@ log = logging.getLogger(__name__)
 
 
 class TokenlessCircleciHandler(BaseTokenlessUploadHandler):
-
     circleci_token = settings.CIRCLECI_TOKEN
 
     def get_build(self):
@@ -60,7 +58,7 @@ class TokenlessCircleciHandler(BaseTokenlessUploadHandler):
 
         if build.get("vcs_revision", "") != self.upload_params.get("commit"):
             log.warning(
-                f"Failed to fetch commit from CircleCI",
+                "Failed to fetch commit from CircleCI",
                 extra=dict(
                     commit=self.upload_params.get("commit"),
                     vcs_revision=build.get("vcs_revision", ""),

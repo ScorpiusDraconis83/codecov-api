@@ -1,14 +1,11 @@
 import asyncio
 import logging
 import re
-from contextlib import suppress
-from datetime import datetime
 from json import dumps
 from uuid import uuid4
 
 import minio
 from django.conf import settings
-from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import MultipleObjectsReturned
 from django.http import Http404, HttpResponse, HttpResponseServerError
 from django.utils import timezone
@@ -16,16 +13,16 @@ from django.utils.decorators import classonlymethod
 from django.utils.encoding import smart_str
 from django.views import View
 from rest_framework import renderers, status
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
-from shared.metrics import metrics
+from shared.api_archive.archive import ArchiveService
+from shared.metrics import inc_counter
 
 from codecov.db import sync_to_async
 from codecov_auth.commands.owner import OwnerCommands
 from core.commands.repository import RepositoryCommands
 from services.analytics import AnalyticsService
-from services.archive import ArchiveService
 from services.redis_configuration import get_redis_connection
 from upload.helpers import (
     check_commit_upload_constraints,
@@ -34,12 +31,13 @@ from upload.helpers import (
     determine_upload_commit_to_use,
     determine_upload_pr_to_use,
     dispatch_upload_task,
+    generate_upload_prometheus_metrics_labels,
     insert_commit,
     parse_headers,
     parse_params,
-    store_report_in_redis,
     validate_upload,
 )
+from upload.metrics import API_UPLOAD_COUNTER
 from upload.views.base import ShelterMixin
 from utils.config import get_config
 from utils.services import get_long_service_name
@@ -67,15 +65,26 @@ class UploadHandler(APIView, ShelterMixin):
         response["Accept"] = "text/*"
         response["Access-Control-Allow-Origin"] = "*"
         response["Access-Control-Allow-Method"] = "POST"
-        response[
-            "Access-Control-Allow-Headers"
-        ] = "Origin, Content-Type, Accept, X-User-Agent"
+        response["Access-Control-Allow-Headers"] = (
+            "Origin, Content-Type, Accept, X-User-Agent"
+        )
 
         return response
 
     def post(self, request, *args, **kwargs):
         # Extract the version
         version = self.kwargs["version"]
+        inc_counter(
+            API_UPLOAD_COUNTER,
+            labels=generate_upload_prometheus_metrics_labels(
+                action="coverage",
+                endpoint="legacy_upload",
+                request=self.request,
+                is_shelter_request=self.is_shelter_request(),
+                position="start",
+                upload_version=version,
+            ),
+        )
 
         log.info(
             f"Received upload request {version}",
@@ -89,9 +98,9 @@ class UploadHandler(APIView, ShelterMixin):
         # Set response headers
         response = HttpResponse()
         response["Access-Control-Allow-Origin"] = "*"
-        response[
-            "Access-Control-Allow-Headers"
-        ] = "Origin, Content-Type, Accept, X-User-Agent"
+        response["Access-Control-Allow-Headers"] = (
+            "Origin, Content-Type, Accept, X-User-Agent"
+        )
 
         # Parse request parameters
         request_params = {
@@ -106,12 +115,7 @@ class UploadHandler(APIView, ShelterMixin):
         if package is not None:
             package_format = r"((codecov-cli/)|((.+-)?uploader-))(\d+.\d+.\d+)"
             match = re.fullmatch(package_format, package)
-            if match:
-                if match.group(2):  # Matches codecov-cli/
-                    metrics.incr(f"upload.cli.{match.group(5)}")
-                else:  # Matches (.+-)?uploader-
-                    metrics.incr(f"upload.uploader.{match.group(5)}")
-            else:
+            if not match:
                 log.warning(
                     "Package query parameter failed to match CLI or uploader format",
                     extra=dict(package=package),
@@ -126,22 +130,19 @@ class UploadHandler(APIView, ShelterMixin):
             )
             response.status_code = status.HTTP_400_BAD_REQUEST
             response.content = "Invalid request parameters"
-            metrics.incr("uploads.rejected", 1)
             return response
 
         # Try to determine the repository associated with the upload based on the params provided
         try:
             repository = determine_repo_for_upload(upload_params)
             owner = repository.author
-        except ValidationError as e:
+        except ValidationError:
             response.status_code = status.HTTP_400_BAD_REQUEST
             response.content = "Could not determine repo and owner"
-            metrics.incr("uploads.rejected", 1)
             return response
-        except MultipleObjectsReturned as e:
+        except MultipleObjectsReturned:
             response.status_code = status.HTTP_400_BAD_REQUEST
             response.content = "Found too many repos"
-            metrics.incr("uploads.rejected", 1)
             return response
 
         log.info(
@@ -152,6 +153,19 @@ class UploadHandler(APIView, ShelterMixin):
                 repo_name=repository.name,
                 owner_username=owner.username,
                 commit=upload_params.get("commit"),
+            ),
+        )
+
+        inc_counter(
+            API_UPLOAD_COUNTER,
+            labels=generate_upload_prometheus_metrics_labels(
+                action="coverage",
+                endpoint="legacy_upload",
+                request=self.request,
+                repository=repository,
+                is_shelter_request=self.is_shelter_request(),
+                position="end",
+                upload_version=version,
             ),
         )
 
@@ -186,13 +200,19 @@ class UploadHandler(APIView, ShelterMixin):
         # --------- Handle the actual upload
 
         reportid = str(uuid4())
-        path = None  # populated later for v4 uploads when generating presigned PUT url
-        redis_key = None  # populated later for v2 uploads when storing report in Redis
+        # populated later for `v4` uploads when generating presigned PUT url,
+        # or by `v2` uploads when storing the report directly
+        path = None
 
         # Get the url where the commit details can be found on the Codecov site, we'll return this in the response
         destination_url = f"{settings.CODECOV_DASHBOARD_URL}/{owner.service}/{owner.username}/{repository.name}/commit/{commitid}"
 
-        # v2 - store request body in redis
+        archive_service = ArchiveService(repository)
+        datetime = timezone.now().strftime("%Y-%m-%d")
+        repo_hash = archive_service.get_archive_hash(repository)
+        default_path = f"v4/raw/{datetime}/{repo_hash}/{commitid}/{reportid}.txt"
+
+        # v2 - store request body directly
         if version == "v2":
             log.info(
                 "Started V2 upload",
@@ -204,15 +224,22 @@ class UploadHandler(APIView, ShelterMixin):
                     upload_params=upload_params,
                 ),
             )
-            redis_key = store_report_in_redis(request, commitid, reportid, redis)
+
+            path = default_path
+            encoding = request.META.get("HTTP_X_CONTENT_ENCODING") or request.META.get(
+                "HTTP_CONTENT_ENCODING"
+            )
+            archive_service.write_file(
+                path, request.body, is_already_gzipped=(encoding == "gzip")
+            )
 
             log.info(
-                "Stored coverage report in redis",
+                "Stored coverage report",
                 extra=dict(
                     commit=commitid,
                     upload_params=upload_params,
                     reportid=reportid,
-                    redis_key=redis_key,
+                    path=path,
                     repoid=repository.repoid,
                 ),
             )
@@ -243,26 +270,19 @@ class UploadHandler(APIView, ShelterMixin):
                 ),
             )
 
-            headers = parse_headers(request.META, upload_params)
-            archive_service = ArchiveService(repository)
+            parse_headers(request.META, upload_params)
 
             # only Shelter requests are allowed to set their own `storage_path`
             path = upload_params.get("storage_path")
             if path is None or not self.is_shelter_request():
-                path = "/".join(
-                    (
-                        "v4/raw",
-                        timezone.now().strftime("%Y-%m-%d"),
-                        archive_service.get_archive_hash(repository),
-                        commitid,
-                        f"{reportid}.txt",
-                    )
-                )
+                path = default_path
 
             try:
-                upload_url = archive_service.create_raw_upload_presigned_put(
-                    commit_sha=commitid, filename="{}.txt".format(reportid)
-                )
+                # When using shelter (`is_shelter_request`), the returned `upload_url` is being
+                # ignored, as shelter is handling the creation of a "presigned put" matching the
+                # `storage_path`.
+                # This code runs here just for backwards compatibility reasons:
+                upload_url = archive_service.create_presigned_put(default_path)
             except Exception as e:
                 log.warning(
                     f"Error generating minio presign put {e}",
@@ -274,7 +294,6 @@ class UploadHandler(APIView, ShelterMixin):
                         upload_params=upload_params,
                     ),
                 )
-                metrics.incr("uploads.rejected", 1)
                 return HttpResponseServerError("Unknown error, please try again later")
             log.info(
                 "Returning presign put",
@@ -303,10 +322,11 @@ class UploadHandler(APIView, ShelterMixin):
             **queue_params,
             "build_url": build_url,
             "reportid": reportid,
-            "redis_key": redis_key,  # location of report for v2 uploads; this will be "None" for v4 uploads
-            "url": path
-            if path  # If a path was generated for a v4 upload, pass that to the 'url' field, potentially overwriting it
-            else upload_params.get("url"),
+            "url": (
+                path
+                if path  # If a path was generated for an upload, pass that to the 'url' field, potentially overwriting it
+                else upload_params.get("url")
+            ),
             # These values below might be different from the initial request parameters, so overwrite them here to ensure they're up-to-date
             "commit": commitid,
             "branch": branch,
@@ -341,7 +361,6 @@ class UploadHandler(APIView, ShelterMixin):
             response["Content-Type"] = "application/json"
 
         response.status_code = status.HTTP_200_OK
-        metrics.incr("uploads.accepted", 1)
         return response
 
 
@@ -359,8 +378,12 @@ class UploadDownloadHandler(View):
         if owner is None:
             raise Http404("Requested report could not be found")
         repo = await RepositoryCommands(
-            self.request.current_owner, self.service
-        ).fetch_repository(owner, self.repo_name)
+            self.request.current_owner,
+            self.service,
+        ).fetch_repository(
+            owner, self.repo_name, [], exclude_okta_enforced_repos=False
+        )  # Okta sign-in is only enforced on the UI for now.
+
         if repo is None:
             raise Http404("Requested report could not be found")
         return repo

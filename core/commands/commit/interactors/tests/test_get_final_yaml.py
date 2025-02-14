@@ -1,14 +1,14 @@
 import asyncio
 from unittest.mock import patch
 
-import pytest
 from asgiref.sync import async_to_sync
-from django.contrib.auth.models import AnonymousUser
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.torngit.exceptions import TorngitObjectNotFoundError
-
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import CommitFactory, RepositoryFactory
 
 from ..get_final_yaml import GetFinalYamlInteractor
 

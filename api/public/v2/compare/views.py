@@ -1,6 +1,4 @@
 from distutils.util import strtobool
-from inspect import Parameter
-
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import mixins
@@ -15,7 +13,6 @@ from api.shared.compare.serializers import (
     ImpactedFilesComparisonSerializer,
     ImpactedFileSegmentsSerializer,
 )
-from core.models import Commit
 from services.components import ComponentComparison, commit_components
 from services.decorators import torngit_safe
 
@@ -120,7 +117,7 @@ class CompareViewSet(
         Returns component comparisons
         """
         comparison = self.get_object()
-        components = commit_components(comparison.head_commit, request.user)
+        components = commit_components(comparison.head_commit, self.owner)
         component_comparisons = [
             ComponentComparison(comparison, component) for component in components
         ]

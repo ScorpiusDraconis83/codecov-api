@@ -2,10 +2,8 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from django.test import TransactionTestCase, override_settings
-from django.utils import timezone
+from shared.django_apps.core.tests.factories import OwnerFactory, RepositoryFactory
 
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import RepositoryFactory
 from timeseries.models import Interval
 
 from .helper import GraphQLTestHelper
@@ -169,7 +167,7 @@ class TestOwnerMeasurements(TransactionTestCase, GraphQLTestHelper):
         ]["measurements"]
         params = owner_coverage_measurements_with_fallback.call_args.args
         # Check that the call is using both private and public repos
-        assert set(params[1]) == set([self.repo1.pk, self.repo2.pk])
+        assert set(params[1]) == {self.repo1.pk, self.repo2.pk}
 
         query = f"""
             query Measurements {{
@@ -185,4 +183,4 @@ class TestOwnerMeasurements(TransactionTestCase, GraphQLTestHelper):
         self.gql_request(query, owner=self.owner)["owner"]["measurements"]
         params = owner_coverage_measurements_with_fallback.call_args.args
         # Check that the call is using both private and public repos
-        assert set(params[1]) == set([self.repo1.pk, self.repo2.pk])
+        assert set(params[1]) == {self.repo1.pk, self.repo2.pk}

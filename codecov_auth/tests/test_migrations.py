@@ -1,10 +1,9 @@
-from datetime import datetime
+import pytest
 
 from utils.test_utils import TestMigrations
 
 
 class Migration0046Test(TestMigrations):
-
     migrate_from = "0045_remove_ownerprofile_terms_agreement"
     migrate_to = "0046_dedupe_owner_admin_values"
 
@@ -53,6 +52,9 @@ class Migration0046Test(TestMigrations):
             admins=[3, 2, 1, 2, 3],
         )
 
+    @pytest.mark.skip(
+        reason="move to shared"
+    )  # TODO move this test to live with auth models in shared
     def test_admins_deduped(self):
         owners = self.apps.get_model("codecov_auth", "Owner")
 

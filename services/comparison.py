@@ -10,20 +10,19 @@ from typing import List, Optional, Tuple
 
 import minio
 import pytz
+import shared.reports.api_report_service as report_service
 from asgiref.sync import async_to_sync
 from django.db.models import Prefetch, QuerySet
 from django.utils.functional import cached_property
+from shared.api_archive.archive import ArchiveService
 from shared.helpers.yaml import walk
-from shared.reports.readonly import ReadOnlyReport
 from shared.reports.types import ReportTotals
 from shared.utils.merge import LineType, line_type
 
-import services.report as report_service
 from compare.models import CommitComparison
-from core.models import Commit
-from reports.models import CommitReport, ReportDetails
+from core.models import Commit, Pull
+from reports.models import CommitReport
 from services import ServiceException
-from services.archive import ArchiveService
 from services.redis_configuration import get_redis_connection
 from services.repo_providers import RepoProviderService
 from utils.config import get_config
@@ -226,7 +225,7 @@ class FileComparisonVisitor:
 
         # copied from ReportFile._line, minus dataclass instantiation
         if line:
-            if type(line) is list:
+            if isinstance(line, list):
                 return line
             else:
                 # these are old versions
@@ -363,7 +362,7 @@ class LineComparison:
             return None
 
         hit_count = 0
-        for (id, coverage, *rest) in self.head_line_sessions:
+        for id, coverage, *rest in self.head_line_sessions:
             if line_type(coverage) == LineType.hit:
                 hit_count += 1
         if hit_count > 0:
@@ -375,7 +374,7 @@ class LineComparison:
             return None
 
         ids = []
-        for (id, coverage, *rest) in self.head_line_sessions:
+        for id, coverage, *rest in self.head_line_sessions:
             if line_type(coverage) == LineType.hit:
                 ids.append(id)
         if len(ids) > 0:
@@ -481,6 +480,15 @@ class Segment:
             if not (line.added or line.removed) and (base_coverage != head_coverage):
                 return True
         return False
+
+    def remove_unintended_changes(self):
+        filtered = []
+        for line in self._lines:
+            base_cov = line.coverage["base"]
+            head_cov = line.coverage["head"]
+            if (line.added or line.removed) or (base_cov == head_cov):
+                filtered.append(line)
+        self._lines = filtered
 
 
 class FileComparison:
@@ -675,7 +683,7 @@ class Comparison(object):
                 file_name, self.head_commit.commitid
             )["content"]
             # make sure the file is str utf-8
-            if type(file_content) is not str:
+            if not isinstance(file_content, str):
                 file_content = str(file_content, "utf-8")
             src = file_content.splitlines()
         else:
@@ -691,7 +699,7 @@ class Comparison(object):
 
     @property
     def git_comparison(self):
-        return self._fetch_comparison_and_reverse_comparison[0]
+        return self._fetch_comparison[0]
 
     @cached_property
     def base_report(self):
@@ -713,14 +721,21 @@ class Comparison(object):
             else:
                 raise e
 
-        report.apply_diff(self.git_comparison["diff"])
+        # Return the old report if the github API call fails for any reason
+        try:
+            report.apply_diff(self.git_comparison["diff"])
+        except Exception:
+            pass
         return report
 
     @cached_property
     def has_different_number_of_head_and_base_sessions(self):
-        self.validate()
+        log.info("has_different_number_of_head_and_base_sessions - Start")
         head_sessions = self.head_report.sessions
         base_sessions = self.base_report.sessions
+        log.info(
+            f"has_different_number_of_head_and_base_sessions - Retrieved sessions - head {len(head_sessions)} / base {len(base_sessions)}"
+        )
         # We're treating this case as false since considering CFF's complicates the logic
         if self._has_cff_sessions(head_sessions) or self._has_cff_sessions(
             base_sessions
@@ -731,10 +746,12 @@ class Comparison(object):
     # I feel this method should belong to the API Report class, but we're thinking of getting rid of that class soon
     # In truth, this should be in the shared.Report class
     def _has_cff_sessions(self, sessions) -> bool:
+        log.info(f"_has_cff_sessions - sessions count {len(sessions)}")
         for session in sessions.values():
             if session.session_type.value == "carriedforward":
+                log.info("_has_cff_sessions - Found carriedforward")
                 return True
-
+        log.info("_has_cff_sessions - No carriedforward")
         return False
 
     @property
@@ -763,10 +780,9 @@ class Comparison(object):
         return commits_queryset
 
     @cached_property
-    def _fetch_comparison_and_reverse_comparison(self):
+    def _fetch_comparison(self):
         """
-        Fetches comparison and reverse comparison concurrently, then
-        caches the result. Returns (comparison, reverse_comparison).
+        Fetches comparison, and caches the result.
         """
         adapter = RepoProviderService().get_adapter(
             self.user, self.base_commit.repository
@@ -775,12 +791,8 @@ class Comparison(object):
             self.base_commit.commitid, self.head_commit.commitid
         )
 
-        reverse_comparison_coro = adapter.get_compare(
-            self.head_commit.commitid, self.base_commit.commitid
-        )
-
         async def runnable():
-            return await asyncio.gather(comparison_coro, reverse_comparison_coro)
+            return await asyncio.gather(comparison_coro)
 
         return async_to_sync(runnable)()
 
@@ -791,18 +803,6 @@ class Comparison(object):
     def non_carried_forward_flags(self):
         flags_dict = self.head_report.flags
         return [flag for flag, vals in flags_dict.items() if not vals.carriedforward]
-
-    @cached_property
-    def has_unmerged_base_commits(self):
-        """
-        We use reverse comparison to detect if any commits exist in the
-        base reference but not in the head reference. We use this information
-        to show a message in the UI urging the user to integrate the changes
-        in the base reference in order to see accurate coverage information.
-        We compare with 1 because torngit injects the base commit into the commits
-        array because reasons.
-        """
-        return len(self._fetch_comparison_and_reverse_comparison[1]["commits"]) > 1
 
 
 class FlagComparison(object):
@@ -870,7 +870,7 @@ class ImpactedFile:
         """
         Returns `True` if the file has any additions or removals in the diff
         """
-        return (
+        return bool(
             self.added_diff_coverage
             and len(self.added_diff_coverage) > 0
             or self.removed_diff_coverage
@@ -954,7 +954,10 @@ class ImpactedFile:
             and self.head_coverage
             and self.head_coverage.coverage
         ):
-            return float(self.head_coverage.coverage - self.base_coverage.coverage)
+            return float(
+                float(self.head_coverage.coverage or 0)
+                - float(self.base_coverage.coverage or 0)
+            )
 
     @cached_property
     def file_name(self) -> Optional[str]:
@@ -1009,7 +1012,7 @@ class ComparisonReport(object):
         try:
             data = archive_service.read_file(self.commit_comparison.report_storage_path)
             return json.loads(data)
-        except:
+        except Exception:
             log.error(
                 "ComparisonReport - couldn't fetch data from storage", exc_info=True
             )
@@ -1138,21 +1141,6 @@ class PullRequestComparison(Comparison):
         ) and bool(self.pull.compared_to)
 
     @cached_property
-    def allow_coverage_offsets(self):
-        """
-        Returns True if "coverage offsets" are allowed, False if not, according
-        to repository yaml settings or app yaml settings if not defined in repository
-        yaml settings.
-        """
-        return walk(
-            _dict=self.pull.repository.yaml,
-            keys=("codecov", "allow_coverage_offsets"),
-            _else=get_config(
-                ("site", "codecov", "allow_coverage_offsets"), default=False
-            ),
-        )
-
-    @cached_property
     def pseudo_diff(self):
         """
         Returns the diff between the 'self.pull.compared_to' field and the
@@ -1198,7 +1186,8 @@ class PullRequestComparison(Comparison):
 class CommitComparisonService:
     """
     Utilities for determining whether a commit comparison needs to be recomputed
-    (and enqueueing that recompute when necessary)
+    (and enqueueing that recompute when necessary), and fetching associated comparisons
+    for pulls
     """
 
     def __init__(self, commit_comparison: CommitComparison):
@@ -1229,18 +1218,6 @@ class CommitComparisonService:
         if self._last_updated_before(self.base_commit.updatestamp):
             return True
 
-        compare_commit_details = self._commit_report_details(self.compare_commit)
-        if compare_commit_details is not None and self._last_updated_before(
-            compare_commit_details.updated_at
-        ):
-            return True
-
-        base_commit_details = self._commit_report_details(self.base_commit)
-        if base_commit_details is not None and self._last_updated_before(
-            base_commit_details.updated_at
-        ):
-            return True
-
         return False
 
     def _last_updated_before(self, timestamp: datetime) -> bool:
@@ -1258,22 +1235,10 @@ class CommitComparisonService:
 
         return timezone.normalize(self.commit_comparison.updated_at) < timestamp
 
-    def _commit_report_details(self, commit: Commit) -> Optional[ReportDetails]:
-        # CommitDetails records are updated by the worker every time a new upload is processed.
-        # We can use the `updated_at` timestamp as a proxy for when a report was last updated.
-        # These are expected to have been preloaded.
-        if hasattr(commit, "commitreport") and hasattr(
-            commit.commitreport, "reportdetails"
-        ):
-            return commit.commitreport.reportdetails
-
     def _load_commit(self, commit_id: int) -> Optional[Commit]:
         prefetch = Prefetch(
             "reports",
-            queryset=CommitReport.objects.coverage_reports()
-            .filter(code=None)
-            .select_related("reportdetails")
-            .defer("reportdetails___files_array"),
+            queryset=CommitReport.objects.coverage_reports().filter(code=None),
         )
         return (
             Commit.objects.filter(pk=commit_id)
@@ -1281,6 +1246,16 @@ class CommitComparisonService:
             .defer("_report")
             .first()
         )
+
+    @staticmethod
+    def get_commit_comparison_for_pull(obj: Pull) -> Optional[CommitComparison]:
+        comparison_qs = CommitComparison.objects.filter(
+            base_commit__commitid=obj.compared_to,
+            compare_commit__commitid=obj.head,
+            base_commit__repository_id=obj.repository_id,
+            compare_commit__repository_id=obj.repository_id,
+        ).select_related("compare_commit", "base_commit")
+        return comparison_qs.first()
 
     @classmethod
     def fetch_precomputed(self, repo_id: int, keys: List[Tuple]) -> QuerySet:

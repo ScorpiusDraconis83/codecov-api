@@ -1,9 +1,12 @@
 from unittest.mock import patch
 
 from django.test import TransactionTestCase
-
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import CommitFactory, PullFactory, RepositoryFactory
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
 
 from ..commit import CommitCommands
 
@@ -34,4 +37,9 @@ class CommitCommandsTest(TransactionTestCase):
     @patch("core.commands.commit.commit.GetUploadsNumberInteractor.execute")
     def test_get_uploads_number_delegate_to_interactor(self, interactor_mock):
         self.command.get_uploads_number(self.commit)
+        interactor_mock.assert_called_once_with(self.commit)
+
+    @patch("core.commands.commit.commit.GetLatestUploadErrorInteractor.execute")
+    def test_get_latest_upload_error_delegate_to_interactor(self, interactor_mock):
+        self.command.get_latest_upload_error(self.commit)
         interactor_mock.assert_called_once_with(self.commit)

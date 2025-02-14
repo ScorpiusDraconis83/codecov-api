@@ -3,14 +3,14 @@ import logging
 from django.http import HttpRequest
 from django.shortcuts import get_object_or_404
 from django.utils.crypto import constant_time_compare
-from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from codecov_auth.models import Owner
-from core.models import Branch, Commit, Pull, PullStates, Repository
+from core.models import Commit, Pull, PullStates, Repository
+from services.refresh import RefreshService
 from services.task import TaskService
 from utils.config import get_config
 from webhook_handlers.constants import (
@@ -19,6 +19,8 @@ from webhook_handlers.constants import (
     WebhookHandlerErrorMessages,
 )
 
+from . import WEBHOOKS_ERRORED, WEBHOOKS_RECEIVED
+
 log = logging.getLogger(__name__)
 
 
@@ -26,34 +28,94 @@ class GitLabWebhookHandler(APIView):
     permission_classes = [AllowAny]
     service_name = "gitlab"
 
+    def _inc_recv(self):
+        event_name = self.request.data.get("event_name")
+        if not event_name:
+            event_name = self.request.data.get("object_kind")
+        action = self.request.data.get("object_attributes", {}).get("action", "")
+
+        WEBHOOKS_RECEIVED.labels(
+            service=self.service_name, event=event_name, action=action
+        ).inc()
+
+    def _inc_err(self, reason: str):
+        event_name = self.request.data.get("event_name")
+        if not event_name:
+            event_name = self.request.data.get("object_kind")
+        action = self.request.data.get("object_attributes", {}).get("action", "")
+
+        WEBHOOKS_ERRORED.labels(
+            service=self.service_name,
+            event=event_name,
+            action=action,
+            error_reason=reason,
+        ).inc()
+
     def post(self, request, *args, **kwargs):
+        """
+        Helpful docs for working with GitLab webhooks
+        https://docs.gitlab.com/ee/user/project/integrations/webhooks.html#webhook-receiver-requirements
+        for those special system hooks: https://docs.gitlab.com/ee/administration/system_hooks.html#hooks-request-example
+        all the other hooks: https://docs.gitlab.com/ee/user/project/integrations/webhook_events.html
+        """
         event = self.request.META.get(GitLabHTTPHeaders.EVENT)
-        repo = None
 
         log.info("GitLab webhook message received", extra=dict(event=event))
 
         project_id = request.data.get("project_id") or request.data.get(
             "object_attributes", {}
         ).get("target_project_id")
-        repo = None
-        if project_id and request.data.get("event_name") != "project_create":
-            # make sure the repo exists in the repos table
+
+        event_name = self.request.data.get(
+            "event_name", self.request.data.get("object_kind")
+        )
+
+        is_enterprise = True if get_config("setup", "enterprise_license") else False
+
+        # special case - only event that doesn't have a repo yet
+        if event_name == "project_create":
+            if event == GitLabWebhookEvents.SYSTEM and is_enterprise:
+                self._inc_recv()
+                return self._handle_system_project_create_hook_event()
+            else:
+                self._inc_err("permission_denied")
+                raise PermissionDenied()
+
+        try:
+            # all other events should correspond to a repo in the db
             repo = get_object_or_404(
                 Repository, author__service=self.service_name, service_id=project_id
             )
+        except Exception as e:
+            self._inc_err("repo_not_found")
+            raise e
 
-        if repo is not None and repo.webhook_secret is not None:
+        webhook_validation = bool(
+            get_config(
+                self.service_name, "webhook_validation", default=False
+            )  # TODO: backfill migration then switch to True
+        )
+        if webhook_validation or repo.webhook_secret:
             self._validate_secret(request, repo.webhook_secret)
 
         if event == GitLabWebhookEvents.PUSH:
+            self._inc_recv()
             return self._handle_push_event(repo)
         elif event == GitLabWebhookEvents.JOB:
+            self._inc_recv()
             return self._handle_job_event(repo)
         elif event == GitLabWebhookEvents.MERGE_REQUEST:
+            self._inc_recv()
             return self._handle_merge_request_event(repo)
         elif event == GitLabWebhookEvents.SYSTEM:
-            return self._handle_system_hook_event(repo)
+            # SYSTEM events have always been gated behind is_enterprise, requires an enterprise_license
+            if not is_enterprise:
+                self._inc_err("permission_denied")
+                raise PermissionDenied()
+            self._inc_recv()
+            return self._handle_system_hook_event(repo, event_name)
 
+        self._inc_err("unhandled_event")
         return Response()
 
     def _handle_push_event(self, repo):
@@ -129,39 +191,70 @@ class GitLabWebhookHandler(APIView):
 
         return Response(data=message)
 
-    def _handle_system_hook_event(self, repo):
+    def _initiate_sync_for_owner(self, owner):
         """
-        GitLab Enterprise instance can send system hooks for changes on user, group, project, etc
-
-        http://doc.gitlab.com/ee/system_hooks/system_hooks.html
+        default: will sync_teams and sync_repos for owner
+        sync_teams to update owner.organizations list (expired memberships are removed and new memberships are added),
+        and username, name, email, and avatar of each Org in owner.organizations.
+        sync_repos to update owner.permission list (private repo access),
+        and name, language, private, repoid, and deleted=False for each repo the owner has access to.
         """
-        if not get_config("setup", "enterprise_license"):
-            raise PermissionDenied("No enterprise license detected")
+        RefreshService().trigger_refresh(
+            ownerid=owner.ownerid,
+            username=owner.username,
+            using_integration=False,
+            manual_trigger=False,
+        )
 
-        event_name = self.request.data.get("event_name")
-        message = None
+    def _try_initiate_sync_for_owner(self):
+        owner_email = self.request.data.get("owner_email")
 
-        if event_name == "project_create":
-            owner_username, repo_name = self.request.data.get(
-                "path_with_namespace"
-            ).split("/", 2)
-
+        # email is a strong identifier (GL users must have a unique email)
+        try:
+            owner = Owner.objects.get(
+                service=self.service_name,
+                oauth_token__isnull=False,
+                email=owner_email,
+            )
+        except (Owner.DoesNotExist, Owner.MultipleObjectsReturned):
+            # could be the username of the OwnerUser or OwnerOrg. Sync only works with an OwnerUser.
+            owner_username_best_guess = self.request.data.get(
+                "path_with_namespace", ""
+            ).split("/")[0]
             try:
                 owner = Owner.objects.get(
-                    service=self.service_name, username=owner_username
+                    service=self.service_name,
+                    oauth_token__isnull=False,
+                    username=owner_username_best_guess,
                 )
+            except (Owner.DoesNotExist, Owner.MultipleObjectsReturned):
+                return
 
-                obj, created = Repository.objects.get_or_create(
-                    author=owner,
-                    service_id=self.request.data.get("project_id"),
-                    name=repo_name,
-                    private=self.request.data.get("project_visibility") == "private",
-                )
-                message = "Repository created"
-            except Owner.DoesNotExist:
-                message = "Repository not created - unknown owner"
+        self._initiate_sync_for_owner(owner)
 
-        elif event_name == "project_destroy":
+    def _handle_system_project_create_hook_event(self):
+        self._try_initiate_sync_for_owner()
+        return Response(data="Sync initiated")
+
+    def _try_initiate_sync_for_repo(self, repo):
+        # most GL repos have bots - try to sync with bot as Owner
+        if repo.bot:
+            bot_owner = Owner.objects.filter(
+                service=self.service_name,
+                ownerid=repo.bot.ownerid,
+                oauth_token__isnull=False,
+            ).first()
+            if bot_owner:
+                return self._initiate_sync_for_owner(owner=bot_owner)
+        self._try_initiate_sync_for_owner()
+
+    def _handle_system_hook_event(self, repo, event_name):
+        """
+        GitLab Enterprise instance can send system hooks for changes on user, group, project, etc
+        """
+        message = None
+
+        if event_name == "project_destroy":
             repo.deleted = True
             repo.activated = False
             repo.active = False
@@ -169,72 +262,34 @@ class GitLabWebhookHandler(APIView):
             repo.save(update_fields=["deleted", "activated", "active", "name"])
             message = "Repository deleted"
 
-        elif event_name == "project_rename":
-            new_name = self.request.data.get("path_with_namespace").split("/")[-1]
-            repo.name = new_name
-            repo.save(update_fields=["name"])
-            message = "Repository renamed"
-
-        elif event_name == "project_transfer":
-            owner_username, repo_name = self.request.data.get(
-                "path_with_namespace"
-            ).split("/")
-            new_owner = Owner.objects.filter(
-                service=self.service_name, username=owner_username
-            ).first()
-
-            if new_owner:
-                repo.author = new_owner
-                repo.name = repo_name
-                repo.save(update_fields=["author", "name"])
-            message = "Repository transfered"
-
-        elif event_name == "user_create":
-            obj, created = Owner.objects.update_or_create(
-                service=self.service_name,
-                service_id=self.request.data.get("user_id"),
-                username=self.request.data.get("username"),
-                email=self.request.data.get("email"),
-                name=self.request.data.get("name"),
-            )
-            message = "User created"
+        elif event_name in ("project_rename", "project_transfer"):
+            self._try_initiate_sync_for_repo(repo=repo)
+            message = "Sync initiated"
 
         elif (
             event_name in ("user_add_to_team", "user_remove_from_team")
             and self.request.data.get("project_visibility") == "private"
         ):
+            # the payload from these hooks includes the ownerid
+            ownerid = self.request.data.get("user_id")
             user = Owner.objects.filter(
                 service=self.service_name,
-                service_id=self.request.data.get("user_id"),
+                service_id=ownerid,
                 oauth_token__isnull=False,
             ).first()
-
+            message = "Sync initiated"
             if user:
-                if event_name == "user_add_to_team":
-                    user.permission = list(
-                        set((user.permission or []) + [int(repo.repoid)])
-                    )
-                    user.save(update_fields=["permission"])
-                    message = "Permission added"
-                else:
-                    new_permissions = set((user.permission or []))
-                    new_permissions.remove(int(repo.repoid))
-                    user.permission = list(new_permissions)
-                    user.save(update_fields=["permission"])
-                    message = "Permission removed"
-            else:
-                message = "User not found or not active"
+                self._initiate_sync_for_owner(owner=user)
 
         return Response(data=message)
 
     def _validate_secret(self, request: HttpRequest, webhook_secret: str):
-        webhook_validation = bool(
-            get_config(self.service_name, "webhook_validation", default=False)
-        )
-        if webhook_validation:
-            token = request.META.get(GitLabHTTPHeaders.TOKEN)
-            if not constant_time_compare(webhook_secret, token):
-                raise PermissionDenied()
+        token = request.META.get(GitLabHTTPHeaders.TOKEN)
+        if token and webhook_secret:
+            if constant_time_compare(webhook_secret, token):
+                return
+        self._inc_err("validation_failed")
+        raise PermissionDenied()
 
 
 class GitLabEnterpriseWebhookHandler(GitLabWebhookHandler):

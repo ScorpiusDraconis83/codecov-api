@@ -1,12 +1,26 @@
+import json
+from datetime import datetime
 from logging import Filter
 
-from pythonjsonlogger.jsonlogger import JsonFormatter, merge_record_extra
-from sentry_sdk import Hub
+from pythonjsonlogger.jsonlogger import JsonFormatter
+from sentry_sdk import get_current_span
 
 
 class BaseLogger(JsonFormatter):
     def add_fields(self, log_record, record, message_dict):
         super(BaseLogger, self).add_fields(log_record, record, message_dict)
+
+        asctime_format = "%Y-%m-%d %H:%M:%S,%f"
+        asctime = datetime.strptime(log_record.get("asctime"), asctime_format)
+
+        log_record["utctime"] = asctime.isoformat()
+
+    def format_json_on_new_lines(self, json_str):
+        # Parse the input JSON string
+        data = json.loads(json_str)
+        # Convert the parsed JSON data back to a formatted JSON string
+        formatted_json = json.dumps(data, indent=4)
+        return formatted_json
 
 
 class CustomLocalJsonFormatter(BaseLogger):
@@ -16,9 +30,10 @@ class CustomLocalJsonFormatter(BaseLogger):
         message = log_record.pop("message")
         exc_info = log_record.pop("exc_info", "")
         content = super().jsonify_log_record(log_record)
+        formatted = super().format_json_on_new_lines(content) if content else None
         if exc_info:
-            return f"{levelname}: {message} --- {content}\n{exc_info}"
-        return f"{levelname}: {message} --- {content}"
+            return f"{levelname}: {message} \n {formatted}\n{exc_info}"
+        return f"{levelname}: {message} \n {formatted}"
 
 
 class CustomDatadogJsonFormatter(BaseLogger):
@@ -35,7 +50,7 @@ class CustomDatadogJsonFormatter(BaseLogger):
         else:
             log_record["level"] = record.levelname
 
-        span = Hub.current.scope.span
+        span = get_current_span()
         if span and span.trace_id:
             log_record["sentry_trace_id"] = span.trace_id
 

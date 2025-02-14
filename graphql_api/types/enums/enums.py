@@ -1,4 +1,7 @@
 import enum
+from typing import Self
+
+from shared.upload.constants import UploadErrorCode as SharedUploadErrorCode
 
 
 class OrderingParameter(enum.Enum):
@@ -8,6 +11,22 @@ class OrderingParameter(enum.Enum):
     MISSES = "misses"
     PARTIALS = "partials"
     LINES = "lines"
+
+
+class TestResultsFilterParameter(enum.Enum):
+    FLAKY_TESTS = "flaky_tests"
+    FAILED_TESTS = "failed_tests"
+    SLOWEST_TESTS = "slowest_tests"
+    SKIPPED_TESTS = "skipped_tests"
+
+
+class TestResultsOrderingParameter(enum.Enum):
+    LAST_DURATION = "last_duration"
+    AVG_DURATION = "avg_duration"
+    FAILURE_RATE = "failure_rate"
+    FLAKE_RATE = "flake_rate"
+    COMMITS_WHERE_FAIL = "commits_where_fail"
+    UPDATED_AT = "updated_at"
 
 
 class PathContentDisplayType(enum.Enum):
@@ -67,10 +86,7 @@ class UploadType(enum.Enum):
     CARRIEDFORWARD = "carriedforward"
 
 
-class UploadErrorEnum(enum.Enum):
-    FILE_NOT_IN_STORAGE = "file_not_in_storage"
-    REPORT_EXPIRED = "report_expired"
-    REPORT_EMPTY = "report_empty"
+UploadErrorEnum = SharedUploadErrorCode
 
 
 class LoginProvider(enum.Enum):
@@ -81,6 +97,15 @@ class LoginProvider(enum.Enum):
     BITBUCKET = "bitbucket"
     BITBUCKET_SERVER = "bitbucket_server"
     OKTA = "okta"
+
+
+class SyncProvider(enum.Enum):
+    GITHUB = "github"
+    GITHUB_ENTERPRISE = "github_enterprise"
+    GITLAB = "gitlab"
+    GITLAB_ENTERPRISE = "gitlab_enterprise"
+    BITBUCKET = "bitbucket"
+    BITBUCKET_SERVER = "bitbucket_server"
 
 
 class CommitErrorGeneralType(enum.Enum):
@@ -94,10 +119,28 @@ class CommitErrorCode(enum.Enum):
     yaml_unknown_error = ("yaml_unknown_error", CommitErrorGeneralType.yaml_error)
     repo_bot_invalid = ("repo_bot_invalid", CommitErrorGeneralType.bot_error)
 
-    def __init__(self, db_string, error_type):
+    def __init__(self, db_string: str, error_type: CommitErrorGeneralType):
         self.db_string = db_string
         self.error_type = error_type
 
     @classmethod
-    def get_codes_from_type(cls, error_type):
+    def get_codes_from_type(cls, error_type: CommitErrorGeneralType) -> list[Self]:
         return [item for item in cls if item.error_type == error_type]
+
+
+class CommitStatus(enum.Enum):
+    COMPLETED = "COMPLETED"
+    ERROR = "ERROR"
+    PENDING = "PENDING"
+
+
+class BundleLoadTypes(enum.Enum):
+    ENTRY = "ENTRY"
+    INITIAL = "INITIAL"
+    LAZY = "LAZY"
+
+
+class AssetOrdering(enum.Enum):
+    NAME = "name"
+    SIZE = "size"
+    TYPE = "asset_type"

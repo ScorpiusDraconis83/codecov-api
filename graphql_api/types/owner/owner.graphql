@@ -1,8 +1,32 @@
 type Owner {
+  account: Account
+  availablePlans: [PlanRepresentation!]
   avatarUrl: String!
-  username: String
+  billing: Billing
+  defaultOrgUsername: String
+  delinquent: Boolean
+  hashOwnerid: String
+  hasPrivateRepos: Boolean
+  invoice(invoiceId: String!): Invoice
+  invoices: [Invoice] @cost(complexity: 100)
+  isAdmin: Boolean
+  isCurrentUserActivated: Boolean
   isCurrentUserPartOfOrg: Boolean!
-  yaml: String
+  isGithubRateLimited: Boolean
+  isUserOktaAuthenticated: Boolean
+  measurements(
+    interval: MeasurementInterval!
+    after: DateTime
+    before: DateTime
+    repos: [String!]
+    isPublic: Boolean
+  ): [Measurement!]
+  numberOfUploads: Int
+  orgUploadToken: String
+  ownerid: Int
+  plan: Plan
+  pretrialPlan: PlanRepresentation
+  repository(name: String!): RepositoryResult!
   repositories(
     filters: RepositorySetFilters
     ordering: RepositoryOrdering
@@ -11,25 +35,11 @@ type Owner {
     after: String
     last: Int
     before: String
-  ): RepositoryConnection!
-  repository(name: String!): RepositoryResult!
-  repositoryDeprecated(name: String!): Repository
-  numberOfUploads: Int
-  hasPrivateRepos: Boolean!
-  isAdmin: Boolean!
-  hashOwnerid: String!
-  ownerid: Int!
-  plan: Plan
-  pretrialPlan: PlanRepresentation
-  availablePlans: [PlanRepresentation!]!
-  orgUploadToken: String
-  defaultOrgUsername: String
-  isCurrentUserActivated: Boolean!
-  measurements(
-    interval: MeasurementInterval!
-    after: DateTime
-    before: DateTime
-    repos: [String!]
-    isPublic: Boolean
-  ): [Measurement!]!
+  ): RepositoryConnection! @cost(complexity: 25, multipliers: ["first", "last"])
+  username: String
+  yaml: String
+  aiFeaturesEnabled: Boolean!
+  aiEnabledRepos: [String]
+  uploadTokenRequired: Boolean
+  activatedUserCount: Int
 }

@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import pytest
 from django.test import override_settings
 from django.urls import reverse
 from shared.torngit import GitlabEnterprise
@@ -20,6 +21,7 @@ def _get_state_from_redis(mock_redis):
     GITLAB_ENTERPRISE_CLIENT_SECRET="testi1iinnfrhnf2q6htycgexmp04f1z2mrd7w7u8bigskhwq2km6yls8e2mddzh"
 )
 @override_settings(GITLAB_ENTERPRISE_REDIRECT_URI="http://localhost/login/gle")
+@pytest.mark.django_db
 def test_get_gle_redirect(client, settings, mock_redis, mocker):
     mock_get_config = mocker.patch(
         "shared.torngit.gitlab_enterprise.get_config",
@@ -35,7 +37,7 @@ def test_get_gle_redirect(client, settings, mock_redis, mocker):
     assert res.status_code == 302
     assert (
         res.url
-        == f"https://my.gitlabenterprise.com/oauth/authorize?response_type=code&client_id=testfiuozujcfo5kxgigugr5x3xxx2ukgyandp16x6w566uits7f32crzl4yvmth&redirect_uri=http%3A%2F%2Flocalhost%2Flogin%2Fgle&state={state}"
+        == f"https://my.gitlabenterprise.com/oauth/authorize?response_type=code&client_id=testfiuozujcfo5kxgigugr5x3xxx2ukgyandp16x6w566uits7f32crzl4yvmth&redirect_uri=http%3A%2F%2Flocalhost%2Flogin%2Fgle&state={state}&scope=api"
     )
     mock_get_config.assert_called_with("gitlab_enterprise", "url")
 
@@ -87,6 +89,9 @@ def test_get_gle_already_with_code(client, mocker, db, settings, mock_redis):
     )
     url = reverse("gle-login")
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gle")
+    session = client.session
+    session["gitlab_enterprise_oauth_state"] = "abc"
+    session.save()
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
     assert res.status_code == 302
 

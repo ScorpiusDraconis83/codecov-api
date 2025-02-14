@@ -50,6 +50,7 @@ class RepoPropertyMixin(OwnerPropertyMixin):
                     f"The branch '{branch_name}' in not in our records. Please provide a valid branch name.",
                     404,
                 )
+
             commit_sha = branch.head
 
         commit = self.repo.commits.filter(commitid=commit_sha).first()

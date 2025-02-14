@@ -1,15 +1,18 @@
-import os
 from unittest.mock import call, patch
 from urllib.parse import urlencode
 
 from django.conf import settings
 from django.test import TestCase
 from rest_framework.reverse import reverse
+from shared.django_apps.core.tests.factories import (
+    BranchFactory,
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.reports.resources import Report, ReportFile, ReportLine
 from shared.utils.sessions import Session
 
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import BranchFactory, CommitFactory, RepositoryFactory
 from services.components import Component
 from utils.test_utils import APIClient
 
@@ -78,6 +81,9 @@ class TotalsViewSetTestCase(TestCase):
             organizations=[self.org.ownerid],
             permission=[self.repo.repoid],
         )
+        # the order in which these commits are created matters
+        # because the branch head is the one that is created
+        # later
         self.commit1 = CommitFactory(
             author=self.org,
             repository=self.repo,
@@ -91,7 +97,7 @@ class TotalsViewSetTestCase(TestCase):
         self.commit3 = CommitFactory(
             author=self.org,
             repository=self.repo,
-            branch=self.branch,
+            branch=self.branch.name,
         )
         self.branch.head = self.commit3.commitid
         self.branch.save()
@@ -141,7 +147,7 @@ class TotalsViewSetTestCase(TestCase):
             else self.client.post(url)
         )
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = sample_report()
@@ -210,7 +216,7 @@ class TotalsViewSetTestCase(TestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit1)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_commit_sha(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = sample_report()
@@ -279,7 +285,7 @@ class TotalsViewSetTestCase(TestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit2)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_nonexistent_commit_sha(
         self, build_report_from_commit, get_repo_permissions
     ):
@@ -293,7 +299,7 @@ class TotalsViewSetTestCase(TestCase):
             "detail": f"The commit {sha} is not in our records. Please specify valid commit."
         }
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_branch(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = sample_report()
@@ -362,7 +368,7 @@ class TotalsViewSetTestCase(TestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit3)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_nonexistent_branch(
         self, build_report_from_commit, get_repo_permissions
     ):
@@ -376,7 +382,7 @@ class TotalsViewSetTestCase(TestCase):
             "detail": f"The branch '{branch}' in not in our records. Please provide a valid branch name."
         }
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_path(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = sample_report()
@@ -426,7 +432,7 @@ class TotalsViewSetTestCase(TestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit1)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_invalid_path(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = sample_report()
@@ -440,7 +446,7 @@ class TotalsViewSetTestCase(TestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit1)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_flag(self, build_report_from_commit, get_repo_permissions):
         get_repo_permissions.return_value = (True, True)
         build_report_from_commit.return_value = flags_report()
@@ -578,10 +584,10 @@ class TotalsViewSetTestCase(TestCase):
     @patch("api.shared.permissions.RepositoryArtifactPermissions.has_permission")
     def test_no_report_if_unauthenticated_token_request(
         self,
-        repository_artifact_permisssions_has_permission,
+        repository_artifact_permissions_has_permission,
         _,
     ):
-        repository_artifact_permisssions_has_permission.return_value = False
+        repository_artifact_permissions_has_permission.return_value = False
 
         res = self._request_report()
         assert res.status_code == 403
@@ -591,7 +597,7 @@ class TotalsViewSetTestCase(TestCase):
         )
 
     @patch("api.public.v2.report.views.commit_components")
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_report_component(
         self, build_report_from_commit, commit_components, get_repo_permissions
     ):
@@ -615,6 +621,7 @@ class TotalsViewSetTestCase(TestCase):
         build_report_from_commit.return_value = sample_report()
 
         res = self._request_report(component_id="foo")
+        commit_components.assert_called_once_with(self.commit1, self.org)
         assert res.status_code == 200
         assert res.json() == {
             "totals": {

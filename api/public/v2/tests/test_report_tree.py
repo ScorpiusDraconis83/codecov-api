@@ -3,11 +3,14 @@ from urllib.parse import urlencode
 
 from rest_framework.reverse import reverse
 from rest_framework.test import APITestCase
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.reports.resources import Report, ReportFile, ReportLine
 from shared.utils.sessions import Session
 
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import CommitFactory, RepositoryFactory
 from utils.test_utils import APIClient
 
 
@@ -65,7 +68,7 @@ class ReportTreeTests(APITestCase):
         self.client = APIClient()
         self.client.force_login_owner(self.current_owner)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_tree(self, build_report_from_commit):
         build_report_from_commit.return_value = sample_report()
 
@@ -103,7 +106,7 @@ class ReportTreeTests(APITestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_tree_depth(self, build_report_from_commit):
         build_report_from_commit.return_value = sample_report()
 
@@ -163,7 +166,7 @@ class ReportTreeTests(APITestCase):
 
         build_report_from_commit.assert_called_once_with(self.commit)
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_tree_path(self, build_report_from_commit):
         build_report_from_commit.return_value = sample_report()
 

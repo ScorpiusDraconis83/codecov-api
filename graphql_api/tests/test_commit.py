@@ -1,21 +1,26 @@
 import asyncio
 import hashlib
+import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 import yaml
 from django.test import TransactionTestCase
+from shared.api_archive.archive import ArchiveService
 from shared.bundle_analysis import StoragePaths
 from shared.bundle_analysis.storage import get_bucket_name
+from shared.django_apps.core.tests.factories import (
+    CommitErrorFactory,
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.reports.types import LineSession
 from shared.storage.memory import MemoryStorageService
 
-import services.comparison as comparison
-from codecov_auth.tests.factories import OwnerFactory
 from compare.models import CommitComparison
 from compare.tests.factories import CommitComparisonFactory
-from core.tests.factories import CommitErrorFactory, CommitFactory, RepositoryFactory
-from graphql_api.types.enums import UploadErrorEnum, UploadState
+from graphql_api.types.enums import CommitStatus, UploadErrorEnum, UploadState
 from graphql_api.types.enums.enums import UploadType
 from reports.models import CommitReport
 from reports.tests.factories import (
@@ -26,7 +31,6 @@ from reports.tests.factories import (
     UploadFactory,
     UploadFlagMembershipFactory,
 )
-from services.archive import ArchiveService
 from services.comparison import MissingComparisonReport
 from services.components import Component
 from services.profiling import CriticalFile
@@ -88,7 +92,7 @@ class MockLines(object):
 
 class MockReport(object):
     def get(self, file, _else):
-        lines = MockLines()
+        MockLines()
         return MockLines()
 
     def filter(self, **kwargs):
@@ -160,23 +164,22 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         self.repo_2 = RepositoryFactory(
             author=self.org, name="test-repo", private=False
         )
-        commits_in_db = [
-            CommitFactory(
-                repository=self.repo_2,
-                commitid=123,
-                timestamp=datetime.today() - timedelta(days=3),
-            ),
-            CommitFactory(
-                repository=self.repo_2,
-                commitid=456,
-                timestamp=datetime.today() - timedelta(days=1),
-            ),
-            CommitFactory(
-                repository=self.repo_2,
-                commitid=789,
-                timestamp=datetime.today() - timedelta(days=2),
-            ),
-        ]
+
+        CommitFactory(
+            repository=self.repo_2,
+            commitid=123,
+            timestamp=datetime.today() - timedelta(days=3),
+        )
+        CommitFactory(
+            repository=self.repo_2,
+            commitid=456,
+            timestamp=datetime.today() - timedelta(days=1),
+        )
+        CommitFactory(
+            repository=self.repo_2,
+            commitid=789,
+            timestamp=datetime.today() - timedelta(days=2),
+        )
 
         variables = {"org": self.org.username, "repo": self.repo_2.name}
         data = self.gql_request(query, variables=variables)
@@ -207,11 +210,11 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         }
         data = self.gql_request(query, variables=variables)
         commit = data["owner"]["repository"]["commit"]
-        assert commit["parent"] == None
+        assert commit["parent"] is None
 
     def test_fetch_commit_coverage(self):
         ReportLevelTotalsFactory(report=self.report, coverage=12)
-        query = query_commit % "totals { coverage } "
+        query = query_commit % "coverageAnalytics { totals { percentCovered }} "
         variables = {
             "org": self.org.username,
             "repo": self.repo.name,
@@ -219,7 +222,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         }
         data = self.gql_request(query, variables=variables)
         commit = data["owner"]["repository"]["commit"]
-        assert commit["totals"]["coverage"] == 12
+        assert commit["coverageAnalytics"]["totals"]["percentCovered"] == 12
 
     def test_fetch_commit_build(self):
         session_one = UploadFactory(report=self.report, provider="circleci")
@@ -239,18 +242,19 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         ]
 
     def test_fetch_commit_uploads_state(self):
-        session_one = UploadFactory(
+        UploadFactory(
             report=self.report, provider="circleci", state=UploadState.PROCESSED.value
         )
-        session_two = UploadFactory(
+        UploadFactory(
             report=self.report, provider="travisci", state=UploadState.ERROR.value
         )
-        session_three = UploadFactory(
+        UploadFactory(
             report=self.report, provider="travisci", state=UploadState.COMPLETE.value
         )
-        session_four = UploadFactory(
+        UploadFactory(
             report=self.report, provider="travisci", state=UploadState.UPLOADED.value
         )
+        UploadFactory(report=self.report, provider="travisci", state="")
         query = (
             query_commit
             % """
@@ -277,6 +281,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
             {"state": UploadState.ERROR.name},
             {"state": UploadState.COMPLETE.name},
             {"state": UploadState.UPLOADED.name},
+            {"state": UploadState.ERROR.name},
         ]
 
     def test_fetch_commit_uploads(self):
@@ -319,7 +324,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
             order_number=4,
         )
         UploadFlagMembershipFactory(report_session=session_e, flag=flag_d)
-        session_f = UploadFactory(
+        UploadFactory(
             report=self.report,
             upload_type=UploadType.UPLOADED.value,
             order_number=5,
@@ -399,10 +404,10 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         session = UploadFactory(
             report=self.report, provider="circleci", state=UploadState.ERROR.value
         )
-        error_one = UploadErrorFactory(
+        UploadErrorFactory(
             report_session=session, error_code=UploadErrorEnum.REPORT_EXPIRED.value
         )
-        error_two = UploadErrorFactory(
+        UploadErrorFactory(
             report_session=session, error_code=UploadErrorEnum.FILE_NOT_IN_STORAGE.value
         )
 
@@ -458,7 +463,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         assert data["owner"]["repository"]["commit"]["yamlState"] == "DEFAULT"
 
     def test_fetch_commit_ci(self):
-        session_one = UploadFactory(
+        UploadFactory(
             report=self.report,
             provider="circleci",
             job_code=123,
@@ -522,13 +527,13 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         "services.profiling.ProfilingSummary.critical_files", new_callable=PropertyMock
     )
     @patch("core.commands.commit.commit.CommitCommands.get_file_content")
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_fetch_commit_coverage_file_call_the_command(
         self, report_mock, content_mock, critical_files
     ):
         query = (
             query_commit
-            % 'coverageFile(path: "path") { hashedPath, content, isCriticalFile, coverage { line,coverage }, totals {coverage} }'
+            % 'coverageAnalytics { coverageFile(path: "path") { hashedPath, content, isCriticalFile, coverage { line,coverage }, totals { percentCovered } } }'
         )
         variables = {
             "org": self.org.username,
@@ -543,14 +548,16 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
                 {"line": 1, "coverage": "H"},
                 {"line": 2, "coverage": "M"},
             ],
-            "totals": {"coverage": 83.0},
+            "totals": {"percentCovered": 83.0},
         }
         content_mock.return_value = "file content"
         critical_files.return_value = [CriticalFile("path")]
 
         report_mock.return_value = MockReport()
         data = self.gql_request(query, variables=variables)
-        coverageFile = data["owner"]["repository"]["commit"]["coverageFile"]
+        coverageFile = data["owner"]["repository"]["commit"]["coverageAnalytics"][
+            "coverageFile"
+        ]
         assert coverageFile["content"] == fake_coverage["content"]
         assert coverageFile["coverage"] == fake_coverage["coverage"]
         assert coverageFile["totals"] == fake_coverage["totals"]
@@ -559,7 +566,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
 
     @patch("services.components.component_filtered_report")
     @patch("services.components.commit_components")
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_fetch_commit_coverage_file_with_components(
         self, report_mock, commit_components_mock, filtered_mock
     ):
@@ -605,8 +612,10 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
                 repository(name: $repo) {
                     ... on Repository {
                         commit(id: $commit) {
-                            coverageFile(path: "path", components: $components) {
-                                hashedPath, content, isCriticalFile, coverage { line,coverage }, totals {coverage}
+                            coverageAnalytics {
+                                coverageFile(path: "path", components: $components) {
+                                    hashedPath, content, isCriticalFile, coverage { line,coverage }, totals { percentCovered }
+                                }
                             }
                         }
                     }
@@ -621,16 +630,18 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
             "owner": {
                 "repository": {
                     "commit": {
-                        "coverageFile": {
-                            "content": None,
-                            "coverage": [
-                                {"coverage": "P", "line": 0},
-                                {"coverage": "H", "line": 1},
-                                {"coverage": "M", "line": 2},
-                            ],
-                            "hashedPath": "d6fe1d0be6347b8ef2427fa629c04485",
-                            "isCriticalFile": False,
-                            "totals": {"coverage": 83.0},
+                        "coverageAnalytics": {
+                            "coverageFile": {
+                                "content": None,
+                                "coverage": [
+                                    {"coverage": "P", "line": 0},
+                                    {"coverage": "H", "line": 1},
+                                    {"coverage": "M", "line": 2},
+                                ],
+                                "hashedPath": "d6fe1d0be6347b8ef2427fa629c04485",
+                                "isCriticalFile": False,
+                                "totals": {"percentCovered": 83.0},
+                            }
                         }
                     }
                 }
@@ -641,13 +652,13 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         "services.profiling.ProfilingSummary.critical_files", new_callable=PropertyMock
     )
     @patch("core.commands.commit.commit.CommitCommands.get_file_content")
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_fetch_commit_with_no_coverage_data(
         self, report_mock, content_mock, critical_files
     ):
         query = (
             query_commit
-            % 'coverageFile(path: "path") { content, isCriticalFile, coverage { line,coverage }, totals {coverage} }'
+            % 'coverageAnalytics { coverageFile(path: "path") { content, isCriticalFile, coverage { line,coverage }, totals { percentCovered } } }'
         )
         variables = {
             "org": self.org.username,
@@ -661,15 +672,17 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
 
         report_mock.return_value = EmptyReport()
         data = self.gql_request(query, variables=variables)
-        coverageFile = data["owner"]["repository"]["commit"]["coverageFile"]
+        coverageFile = data["owner"]["repository"]["commit"]["coverageAnalytics"][
+            "coverageFile"
+        ]
         assert coverageFile["content"] == fake_coverage["content"]
         assert coverageFile["coverage"] == fake_coverage["coverage"]
         assert coverageFile["totals"] == fake_coverage["totals"]
         assert coverageFile["isCriticalFile"] == False
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     def test_flag_names(self, report_mock):
-        query = query_commit % "flagNames"
+        query = query_commit % "coverageAnalytics { flagNames }"
         variables = {
             "org": self.org.username,
             "repo": self.repo.name,
@@ -678,7 +691,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         }
         report_mock.return_value = MockReport()
         data = self.gql_request(query, variables=variables)
-        flags = data["owner"]["repository"]["commit"]["flagNames"]
+        flags = data["owner"]["repository"]["commit"]["coverageAnalytics"]["flagNames"]
         assert flags == ["flag_a", "flag_b"]
 
     def test_fetch_commit_compare_call_the_command(self):
@@ -706,7 +719,9 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
             query_commit
             % """
             compareWithParent { __typename ... on Comparison { state } }
-            bundleAnalysisCompareWithParent { __typename ... on BundleAnalysisComparison { sizeDelta } }
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent { __typename ... on BundleAnalysisComparison { bundleData { size { uncompress } } } }
+            }
             """
         )
         variables = {
@@ -718,7 +733,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         commit = data["owner"]["repository"]["commit"]
         assert commit["compareWithParent"]["__typename"] == "MissingBaseCommit"
         assert (
-            commit["bundleAnalysisCompareWithParent"]["__typename"]
+            commit["bundleAnalysis"]["bundleAnalysisCompareWithParent"]["__typename"]
             == "MissingBaseCommit"
         )
 
@@ -814,20 +829,34 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         query = (
             query_commit
             % """
-            bundleAnalysisCompareWithParent {
-                __typename
-                ... on BundleAnalysisComparison {
-                    sizeDelta
-                    sizeTotal
-                    loadTimeDelta
-                    loadTimeTotal
-                    bundles {
-                        name
-                        changeType
-                        sizeDelta
-                        sizeTotal
-                        loadTimeDelta
-                        loadTimeTotal
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent {
+                    __typename
+                    ... on BundleAnalysisComparison {
+                        bundles {
+                            name
+                            changeType
+                            bundleData {
+                                size {
+                                    uncompress
+                                }
+                            }
+                            bundleChange {
+                                size {
+                                    uncompress
+                                }
+                            }
+                        }
+                        bundleData {
+                            size {
+                                uncompress
+                            }
+                        }
+                        bundleChange {
+                            size {
+                                uncompress
+                            }
+                        }
                     }
                 }
             }
@@ -841,55 +870,1306 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         }
         data = self.gql_request(query, variables=variables)
         commit = data["owner"]["repository"]["commit"]
-        assert commit["bundleAnalysisCompareWithParent"] == {
+        assert commit["bundleAnalysis"]["bundleAnalysisCompareWithParent"] == {
             "__typename": "BundleAnalysisComparison",
-            "sizeDelta": 36555,
-            "sizeTotal": 201720,
-            "loadTimeDelta": 0.1,
-            "loadTimeTotal": 0.5,
             "bundles": [
                 {
                     "name": "b1",
                     "changeType": "changed",
-                    "sizeDelta": 5,
-                    "sizeTotal": 20,
-                    "loadTimeDelta": 0.0,
-                    "loadTimeTotal": 0.0,
+                    "bundleData": {"size": {"uncompress": 20}},
+                    "bundleChange": {"size": {"uncompress": 5}},
                 },
                 {
                     "name": "b2",
                     "changeType": "changed",
-                    "sizeDelta": 50,
-                    "sizeTotal": 200,
-                    "loadTimeDelta": 0.0,
-                    "loadTimeTotal": 0.0,
+                    "bundleData": {"size": {"uncompress": 200}},
+                    "bundleChange": {"size": {"uncompress": 50}},
                 },
                 {
                     "name": "b3",
                     "changeType": "added",
-                    "sizeDelta": 1500,
-                    "sizeTotal": 1500,
-                    "loadTimeDelta": 0.0,
-                    "loadTimeTotal": 0.0,
+                    "bundleData": {"size": {"uncompress": 1500}},
+                    "bundleChange": {"size": {"uncompress": 1500}},
                 },
                 {
                     "name": "b5",
                     "changeType": "changed",
-                    "sizeDelta": 50000,
-                    "sizeTotal": 200000,
-                    "loadTimeDelta": 0.1,
-                    "loadTimeTotal": 0.5,
+                    "bundleData": {"size": {"uncompress": 200000}},
+                    "bundleChange": {"size": {"uncompress": 50000}},
                 },
                 {
                     "name": "b4",
                     "changeType": "removed",
-                    "sizeDelta": -15000,
-                    "sizeTotal": 0,
-                    "loadTimeDelta": -0.0,
-                    "loadTimeTotal": 0.0,
+                    "bundleData": {"size": {"uncompress": 0}},
+                    "bundleChange": {"size": {"uncompress": -15000}},
                 },
             ],
+            "bundleData": {"size": {"uncompress": 201720}},
+            "bundleChange": {"size": {"uncompress": 36555}},
         }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_compare_with_compare_sha(self, get_storage_service):
+        """
+        This tests creates 3 commits C1 -> C2 -> C3
+        C1 uses Report1, C2 and C3 uses Report2
+        Normally when doing a compare of C3, it would select C2 as its parent
+        then it would show no change, as expected
+        However the difference is that in C3's Report2 it has the compareSha set to C1.commitid
+        Now when doing comparison of C3, it would now select C1 as the parent
+        therefore show correct comparison in numbers between Report1 and Report2
+        """
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        commit_1 = CommitFactory(
+            repository=self.repo,
+            commitid="6ca727b0142bf5625bb82af2555d308862063222",
+        )
+        commit_2 = CommitFactory(
+            repository=self.repo, parent_commit_id=commit_1.commitid
+        )
+        commit_3 = CommitFactory(
+            repository=self.repo, parent_commit_id=commit_2.commitid
+        )
+
+        commit_report_1 = CommitReportFactory(
+            commit=commit_1,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+
+        commit_report_2 = CommitReportFactory(
+            commit=commit_2,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+
+        commit_report_3 = CommitReportFactory(
+            commit=commit_3,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=commit_report_1.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=commit_report_2.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open(
+            "./services/tests/samples/head_bundle_report_with_compare_sha_6ca727b0142bf5625bb82af2555d308862063222.sqlite",
+            "rb",
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=commit_report_3.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent {
+                    __typename
+                    ... on BundleAnalysisComparison {
+                        bundleData {
+                            size {
+                                uncompress
+                            }
+                        }
+                        bundleChange {
+                            size {
+                                uncompress
+                            }
+                        }
+                    }
+                }
+            }
+            """
+        )
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": commit_report_3.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["bundleAnalysis"]["bundleAnalysisCompareWithParent"] == {
+            "__typename": "BundleAnalysisComparison",
+            "bundleData": {"size": {"uncompress": 201720}},
+            "bundleChange": {"size": {"uncompress": 36555}},
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_sqlite_file_deleted(self, get_storage_service):
+        os.system("rm -rf /tmp/bundle_analysis_*")
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        base_commit_report = CommitReportFactory(
+            commit=self.parent_commit,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=base_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent {
+                    __typename
+                    ... on BundleAnalysisComparison {
+                        bundleData {
+                            size {
+                                uncompress
+                            }
+                        }
+                    }
+                }
+            }
+            """
+        )
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        self.gql_request(query, variables=variables)
+
+        for file in os.listdir("/tmp"):
+            assert not file.startswith("bundle_analysis_")
+        os.system("rm -rf /tmp/bundle_analysis_*")
+
+    @patch("graphql_api.views.os.unlink")
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_sqlite_file_not_deleted(
+        self, get_storage_service, os_unlink_mock
+    ):
+        os.system("rm -rf /tmp/bundle_analysis_*")
+        os_unlink_mock.side_effect = Exception("something went wrong")
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        base_commit_report = CommitReportFactory(
+            commit=self.parent_commit,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=base_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent {
+                    __typename
+                    ... on BundleAnalysisComparison {
+                        bundleData {
+                            size {
+                                uncompress
+                            }
+                        }
+                    }
+                }
+            }
+            """
+        )
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        self.gql_request(query, variables=variables)
+
+        found = False
+        for file in os.listdir("/tmp"):
+            if file.startswith("bundle_analysis_"):
+                found = True
+                break
+        assert found
+        os.system("rm -rf /tmp/bundle_analysis_*")
+
+    def test_bundle_analysis_missing_report(self):
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisReport {
+                    __typename
+                    ... on MissingHeadReport {
+                        message
+                    }
+                }
+            }
+            """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "MissingHeadReport",
+            "message": "Missing head report",
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundles {
+                                                name
+                                                assets {
+                                                    normalizedName
+                                                }
+                                                asset(name: "not_exist") {
+                                                    normalizedName
+                                                }
+                                                bundleData {
+                                                    loadTime {
+                                                        threeG
+                                                        highSpeed
+                                                    }
+                                                    size {
+                                                        gzip
+                                                        uncompress
+                                                    }
+                                                }
+                                                isCached
+                                                cacheConfig
+                                            }
+                                            bundleData {
+                                                loadTime {
+                                                    threeG
+                                                    highSpeed
+                                                }
+                                                size {
+                                                    gzip
+                                                    uncompress
+                                                }
+                                            }
+                                            bundle(name: "not_exist") {
+                                                name
+                                                isCached
+                                            }
+                                            isCached
+                                        }
+                                        ... on MissingHeadReport {
+                                            message
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundles": [
+                {
+                    "name": "b1",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 0,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 20,
+                        },
+                    },
+                    "isCached": False,
+                    "cacheConfig": False,
+                },
+                {
+                    "name": "b2",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 2,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 200,
+                        },
+                    },
+                    "isCached": False,
+                    "cacheConfig": False,
+                },
+                {
+                    "name": "b3",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 16,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 1500,
+                        },
+                    },
+                    "isCached": False,
+                    "cacheConfig": False,
+                },
+                {
+                    "name": "b5",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 2133,
+                            "highSpeed": 53,
+                        },
+                        "size": {
+                            "gzip": 200,
+                            "uncompress": 200000,
+                        },
+                    },
+                    "isCached": False,
+                    "cacheConfig": False,
+                },
+            ],
+            "bundleData": {
+                "loadTime": {
+                    "threeG": 2151,
+                    "highSpeed": 53,
+                },
+                "size": {
+                    "gzip": 201,
+                    "uncompress": 201720,
+                },
+            },
+            "bundle": None,
+            "isCached": False,
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_first_after(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    first: 2,
+                                                    after: "5",
+                                                ){
+                                                    totalCount
+                                                    edges {
+                                                        cursor
+                                                        node {
+                                                            normalizedName
+                                                        }
+                                                    }
+                                                    pageInfo {
+                                                        hasNextPage
+                                                        hasPreviousPage
+                                                        startCursor
+                                                        endCursor
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "ordering": "NAME",
+            "orderingDirection": "ASC",
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "assetsPaginated": {
+                    "totalCount": 5,
+                    "edges": [
+                        {
+                            "cursor": "4",
+                            "node": {
+                                "normalizedName": "assets/index-*.js",
+                            },
+                        },
+                        {
+                            "cursor": "2",
+                            "node": {
+                                "normalizedName": "assets/index-*.css",
+                            },
+                        },
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": True,
+                        "hasPreviousPage": False,
+                        "startCursor": "4",
+                        "endCursor": "2",
+                    },
+                }
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_first_after_non_existing_cursor(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    first: 2,
+                                                    after: "notanumber",
+                                                ){
+                                                    totalCount
+                                                    edges {
+                                                        cursor
+                                                        node {
+                                                            normalizedName
+                                                        }
+                                                    }
+                                                    pageInfo {
+                                                        hasNextPage
+                                                        hasPreviousPage
+                                                        startCursor
+                                                        endCursor
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "ordering": "NAME",
+            "orderingDirection": "ASC",
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "assetsPaginated": {
+                    "totalCount": 5,
+                    "edges": [
+                        {
+                            "cursor": "3",
+                            "node": {
+                                "normalizedName": "assets/LazyComponent-*.js",
+                            },
+                        },
+                        {
+                            "cursor": "5",
+                            "node": {
+                                "normalizedName": "assets/index-*.js",
+                            },
+                        },
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": True,
+                        "hasPreviousPage": False,
+                        "startCursor": "3",
+                        "endCursor": "5",
+                    },
+                }
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_last_before(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    last: 2,
+                                                    before: "1",
+                                                ){
+                                                    totalCount
+                                                    edges {
+                                                        cursor
+                                                        node {
+                                                            normalizedName
+                                                        }
+                                                    }
+                                                    pageInfo {
+                                                        hasNextPage
+                                                        hasPreviousPage
+                                                        startCursor
+                                                        endCursor
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "ordering": "NAME",
+            "orderingDirection": "ASC",
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "assetsPaginated": {
+                    "totalCount": 5,
+                    "edges": [
+                        {
+                            "cursor": "4",
+                            "node": {
+                                "normalizedName": "assets/index-*.js",
+                            },
+                        },
+                        {
+                            "cursor": "2",
+                            "node": {
+                                "normalizedName": "assets/index-*.css",
+                            },
+                        },
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": False,
+                        "hasPreviousPage": True,
+                        "startCursor": "4",
+                        "endCursor": "2",
+                    },
+                }
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_last_before_non_existing_cursor(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    last: 2,
+                                                    before: "99999",
+                                                ){
+                                                    totalCount
+                                                    edges {
+                                                        cursor
+                                                        node {
+                                                            normalizedName
+                                                        }
+                                                    }
+                                                    pageInfo {
+                                                        hasNextPage
+                                                        hasPreviousPage
+                                                        startCursor
+                                                        endCursor
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "ordering": "NAME",
+            "orderingDirection": "ASC",
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "assetsPaginated": {
+                    "totalCount": 5,
+                    "edges": [
+                        {
+                            "cursor": "2",
+                            "node": {
+                                "normalizedName": "assets/index-*.css",
+                            },
+                        },
+                        {
+                            "cursor": "1",
+                            "node": {
+                                "normalizedName": "assets/react-*.svg",
+                            },
+                        },
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": False,
+                        "hasPreviousPage": True,
+                        "startCursor": "2",
+                        "endCursor": "1",
+                    },
+                }
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_before_and_after_error(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    before: "1",
+                                                    after: "2",
+                                                ){
+                                                    totalCount
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, with_errors=True, variables=variables)
+        commit = data["data"]["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {"assetsPaginated": None},
+        }
+
+        assert (
+            data["errors"][0]["message"]
+            == "After and before can not be used at the same time"
+        )
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_assets_paginated_first_and_last_error(
+        self, get_storage_service
+    ):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit(
+                $org: String!,
+                $repo: String!,
+                $commit: String!,
+                $ordering: AssetOrdering,
+                $orderingDirection: OrderingDirection
+            ) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b1") {
+                                                assetsPaginated (
+                                                    ordering: $ordering,
+                                                    orderingDirection: $orderingDirection,
+                                                    first: 1,
+                                                    last: 2,
+                                                ){
+                                                    totalCount
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, with_errors=True, variables=variables)
+        commit = data["data"]["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {"assetsPaginated": None},
+        }
+
+        assert (
+            data["errors"][0]["message"]
+            == "First and last can not be used at the same time"
+        )
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_asset(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open(
+            "./services/tests/samples/bundle_with_assets_and_modules.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b5") {
+                                                moduleCount
+                                                asset(name: "assets/LazyComponent-fcbb0922.js") {
+                                                    name
+                                                    normalizedName
+                                                    extension
+                                                    bundleData {
+                                                        loadTime {
+                                                            threeG
+                                                            highSpeed
+                                                        }
+                                                        size {
+                                                            gzip
+                                                            uncompress
+                                                        }
+                                                    }
+                                                    modules {
+                                                        name
+                                                        bundleData {
+                                                            loadTime {
+                                                                threeG
+                                                                highSpeed
+                                                            }
+                                                            size {
+                                                                gzip
+                                                                uncompress
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        bundle_report = commit["bundleAnalysis"]["bundleAnalysisReport"]["bundle"]
+        asset_report = bundle_report["asset"]
+
+        assert bundle_report is not None
+        assert bundle_report["moduleCount"] == 33
+
+        assert asset_report is not None
+        assert asset_report["name"] == "assets/LazyComponent-fcbb0922.js"
+        assert asset_report["normalizedName"] == "assets/LazyComponent-*.js"
+        assert asset_report["extension"] == "js"
+        assert asset_report["bundleData"] == {
+            "loadTime": {
+                "threeG": 320,
+                "highSpeed": 8,
+            },
+            "size": {
+                "gzip": 30,
+                "uncompress": 30000,
+            },
+        }
+
+        modules = sorted(asset_report["modules"], key=lambda m: m["name"])
+
+        assert modules and len(modules) == 3
+        assert modules[0] == {
+            "name": "./src/LazyComponent/LazyComponent",
+            "bundleData": {
+                "loadTime": {
+                    "threeG": 64,
+                    "highSpeed": 1,
+                },
+                "size": {
+                    "gzip": 6,
+                    "uncompress": 6000,
+                },
+            },
+        }
+        assert modules[1] == {
+            "name": "./src/LazyComponent/LazyComponent.tsx",
+            "bundleData": {
+                "loadTime": {
+                    "threeG": 53,
+                    "highSpeed": 1,
+                },
+                "size": {
+                    "gzip": 5,
+                    "uncompress": 5000,
+                },
+            },
+        }
+        assert modules[2] == {
+            "name": "./src/LazyComponent/LazyComponent.tsx?module",
+            "bundleData": {
+                "loadTime": {
+                    "threeG": 53,
+                    "highSpeed": 1,
+                },
+                "size": {
+                    "gzip": 4,
+                    "uncompress": 4970,
+                },
+            },
+        }
+
+    @patch("shared.bundle_analysis.BundleReport.asset_reports")
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_asset_filtering(
+        self, get_storage_service, asset_reports_mock
+    ):
+        storage = MemoryStorageService({})
+
+        get_storage_service.return_value = storage
+        asset_reports_mock.return_value = []
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open(
+            "./services/tests/samples/bundle_with_assets_and_modules.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!, $filters: BundleAnalysisReportFilters) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b5", filters: $filters) {
+                                                moduleCount
+                                                assets {
+                                                    name
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "filters": {},
+        }
+
+        configurations = [
+            # No filters
+            (
+                {"loadTypes": None, "reportGroups": None},
+                {"asset_types": None, "chunk_entry": None, "chunk_initial": None},
+            ),
+            ({}, {"asset_types": None, "chunk_entry": None, "chunk_initial": None}),
+            # Just report groups
+            (
+                {"reportGroups": ["JAVASCRIPT", "FONT"]},
+                {
+                    "asset_types": ["JAVASCRIPT", "FONT"],
+                    "chunk_entry": None,
+                    "chunk_initial": None,
+                },
+            ),
+            # Load types -> chunk_entry cancels out
+            (
+                {"loadTypes": ["ENTRY", "INITIAL"]},
+                {"asset_types": None, "chunk_entry": None, "chunk_initial": True},
+            ),
+            # Load types -> chunk_entry = True
+            (
+                {"loadTypes": ["ENTRY"]},
+                {"asset_types": None, "chunk_entry": True, "chunk_initial": None},
+            ),
+            # Load types -> chunk_lazy = False
+            (
+                {"loadTypes": ["LAZY"]},
+                {"asset_types": None, "chunk_entry": False, "chunk_initial": False},
+            ),
+            # Load types -> chunk_initial cancels out
+            (
+                {"loadTypes": ["LAZY", "INITIAL"]},
+                {"asset_types": None, "chunk_entry": False, "chunk_initial": None},
+            ),
+            # Load types -> chunk_initial = True
+            (
+                {"loadTypes": ["INITIAL"]},
+                {"asset_types": None, "chunk_entry": False, "chunk_initial": True},
+            ),
+            # Load types -> chunk_initial = False
+            (
+                {"loadTypes": ["LAZY"]},
+                {"asset_types": None, "chunk_entry": False, "chunk_initial": False},
+            ),
+        ]
+
+        for config in configurations:
+            input_d, output_d = config
+            variables["filters"] = input_d
+            data = self.gql_request(query, variables=variables)
+            assert (
+                data["owner"]["repository"]["commit"]["bundleAnalysis"][
+                    "bundleAnalysisReport"
+                ]["bundle"]
+                is not None
+            )
+            asset_reports_mock.assert_called_with(**output_d)
 
     def test_compare_with_parent_missing_change_coverage(self):
         CommitComparisonFactory(
@@ -919,7 +2199,7 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         }
         data = self.gql_request(query, variables=variables)
         commit = data["owner"]["repository"]["commit"]
-        assert commit["compareWithParent"]["changeCoverage"] == None
+        assert commit["compareWithParent"]["changeCoverage"] is None
 
     @patch(
         "services.profiling.ProfilingSummary.critical_files", new_callable=PropertyMock
@@ -1111,3 +2391,1182 @@ class TestCommit(GraphQLTestHelper, TransactionTestCase):
         data = self.gql_request(query, variables=variables)
         assert (data["owner"]["repository"]["commit"]["totalUploads"]) == 99
         assert len(data["owner"]["repository"]["commit"]["uploads"]["edges"]) == 25
+
+    def test_fetch_commit_status_no_reports(self):
+        query = (
+            query_commit
+            % """
+            coverageStatus
+            bundleStatus
+        """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageStatus"] is None
+        assert commit["bundleStatus"] is None
+
+    def test_fetch_commit_status_no_sessions(self):
+        CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.COVERAGE
+        )
+        CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        query = (
+            query_commit
+            % """
+            coverageStatus
+            bundleStatus
+        """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageStatus"] is None
+        assert commit["bundleStatus"] is None
+
+    def test_fetch_commit_status_completed(self):
+        coverage_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.COVERAGE
+        )
+        UploadFactory(report=coverage_report, state="processed")
+        UploadFactory(report=coverage_report, state="processed")
+        UploadFactory(report=coverage_report, state="fully_overwritten")
+        UploadFactory(report=coverage_report, state="partially_overwritten")
+
+        ba_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        UploadFactory(report=ba_report, state="processed")
+        UploadFactory(report=ba_report, state="processed")
+        UploadFactory(report=ba_report, state="fully_overwritten")
+        UploadFactory(report=ba_report, state="partially_overwritten")
+
+        query = (
+            query_commit
+            % """
+            coverageStatus
+            bundleStatus
+        """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageStatus"] == CommitStatus.COMPLETED.value
+        assert commit["bundleStatus"] == CommitStatus.COMPLETED.value
+
+    def test_fetch_commit_status_error(self):
+        coverage_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.COVERAGE
+        )
+        UploadFactory(report=coverage_report, state="processed")
+        UploadFactory(report=coverage_report, state="error")
+        UploadFactory(report=coverage_report, state="uploaded")
+        UploadFactory(report=coverage_report, state="partially_overwritten")
+
+        ba_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        UploadFactory(report=ba_report, state="processed")
+        UploadFactory(report=ba_report, state="error")
+        UploadFactory(report=ba_report, state="uploaded")
+        UploadFactory(report=ba_report, state="partially_overwritten")
+
+        query = (
+            query_commit
+            % """
+            coverageStatus
+            bundleStatus
+        """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageStatus"] == CommitStatus.ERROR.value
+        assert commit["bundleStatus"] == CommitStatus.ERROR.value
+
+    def test_fetch_commit_status_pending(self):
+        coverage_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.COVERAGE
+        )
+        UploadFactory(report=coverage_report, state="processed")
+        UploadFactory(report=coverage_report, state="processed")
+        UploadFactory(report=coverage_report, state="uploaded")
+        UploadFactory(report=coverage_report, state="partially_overwritten")
+
+        ba_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        UploadFactory(report=ba_report, state="processed")
+        UploadFactory(report=ba_report, state="processed")
+        UploadFactory(report=ba_report, state="uploaded")
+        UploadFactory(report=ba_report, state="partially_overwritten")
+
+        query = (
+            query_commit
+            % """
+            coverageStatus
+            bundleStatus
+        """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageStatus"] == CommitStatus.PENDING.value
+        assert commit["bundleStatus"] == CommitStatus.PENDING.value
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_gzip_size_total(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open(
+            "./services/tests/samples/head_bundle_report_with_gzip_size.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundles {
+                                                name
+                                                bundleData {
+                                                    size {
+                                                        gzip
+                                                        uncompress
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundles": [
+                {
+                    # All assets non compressible
+                    "name": "b1",
+                    "bundleData": {
+                        "size": {
+                            "gzip": 20,
+                            "uncompress": 20,
+                        },
+                    },
+                },
+                {
+                    # Some assets non compressible
+                    "name": "b2",
+                    "bundleData": {
+                        "size": {
+                            "gzip": 198,
+                            "uncompress": 200,
+                        },
+                    },
+                },
+                {
+                    # All assets non compressible
+                    "name": "b3",
+                    "bundleData": {
+                        "size": {
+                            "gzip": 1495,
+                            "uncompress": 1500,
+                        },
+                    },
+                },
+                {
+                    # All assets non compressible
+                    "name": "b5",
+                    "bundleData": {
+                        "size": {
+                            "gzip": 199995,
+                            "uncompress": 200000,
+                        },
+                    },
+                },
+            ],
+        }
+
+    def test_coverage_totals(self):
+        ReportLevelTotalsFactory(report=self.report, coverage=12)
+        query = query_commit % "coverageAnalytics { totals { percentCovered } } "
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["coverageAnalytics"]["totals"]["percentCovered"] == 12
+
+    @patch(
+        "services.profiling.ProfilingSummary.critical_files", new_callable=PropertyMock
+    )
+    @patch("core.commands.commit.commit.CommitCommands.get_file_content")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
+    def test_fetch_commit_coverage_coverage_file(
+        self, report_mock, content_mock, critical_files
+    ):
+        query = (
+            query_commit
+            % 'coverageAnalytics { coverageFile(path: "path") { hashedPath, content, isCriticalFile, coverage { line,coverage }, totals { percentCovered } } }'
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "path": "path",
+        }
+        fake_coverage = {
+            "content": "file content",
+            "coverage": [
+                {"line": 0, "coverage": "P"},
+                {"line": 1, "coverage": "H"},
+                {"line": 2, "coverage": "M"},
+            ],
+            "totals": {"percentCovered": 83.0},
+        }
+        content_mock.return_value = "file content"
+        critical_files.return_value = [CriticalFile("path")]
+
+        report_mock.return_value = MockReport()
+        data = self.gql_request(query, variables=variables)
+        coverageFile = data["owner"]["repository"]["commit"]["coverageAnalytics"][
+            "coverageFile"
+        ]
+        assert coverageFile["content"] == fake_coverage["content"]
+        assert coverageFile["coverage"] == fake_coverage["coverage"]
+        assert coverageFile["totals"] == fake_coverage["totals"]
+        assert coverageFile["isCriticalFile"] == True
+        assert coverageFile["hashedPath"] == hashlib.md5("path".encode()).hexdigest()
+
+    @patch("services.components.component_filtered_report")
+    @patch("services.components.commit_components")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
+    def test_fetch_commit_coverage_coverage_file_with_components(
+        self, report_mock, commit_components_mock, filtered_mock
+    ):
+        components = ["Global"]
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "path": "path",
+            "components": components,
+        }
+
+        report_mock.return_value = MockReport()
+        commit_components_mock.return_value = [
+            Component.from_dict(
+                {
+                    "component_id": "c1",
+                    "name": "ComponentOne",
+                    "paths": ["fileA.py"],
+                }
+            ),
+            Component.from_dict(
+                {
+                    "component_id": "c2",
+                    "name": "ComponentTwo",
+                    "paths": ["fileB.py"],
+                }
+            ),
+            Component.from_dict(
+                {
+                    "component_id": "global",
+                    "name": "Global",
+                    "paths": ["**/*.py"],
+                }
+            ),
+        ]
+        filtered_mock.return_value = MockReport()
+
+        query_files = """
+        query FetchCommit($org: String!, $repo: String!, $commit: String!, $components: [String!]!) {
+            owner(username: $org) {
+                repository(name: $repo) {
+                    ... on Repository {
+                        commit(id: $commit) {
+                            coverageAnalytics {
+                                coverageFile(path: "path", components: $components) {
+                                    hashedPath, content, isCriticalFile, coverage { line,coverage }, totals { percentCovered }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+
+        data = self.gql_request(query_files, variables=variables)
+
+        assert data == {
+            "owner": {
+                "repository": {
+                    "commit": {
+                        "coverageAnalytics": {
+                            "coverageFile": {
+                                "content": None,
+                                "coverage": [
+                                    {"coverage": "P", "line": 0},
+                                    {"coverage": "H", "line": 1},
+                                    {"coverage": "M", "line": 2},
+                                ],
+                                "hashedPath": "d6fe1d0be6347b8ef2427fa629c04485",
+                                "isCriticalFile": False,
+                                "totals": {"percentCovered": 83.0},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    @patch(
+        "services.profiling.ProfilingSummary.critical_files", new_callable=PropertyMock
+    )
+    @patch("core.commands.commit.commit.CommitCommands.get_file_content")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
+    def test_fetch_commit_coverage_with_no_coverage_data(
+        self, report_mock, content_mock, critical_files
+    ):
+        query = (
+            query_commit
+            % 'coverageAnalytics { coverageFile(path: "path") { content, isCriticalFile, coverage { line,coverage }, totals { percentCovered } }}'
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "path": "path",
+        }
+        fake_coverage = {"content": "file content", "coverage": [], "totals": None}
+        content_mock.return_value = "file content"
+        critical_files.return_value = []
+
+        report_mock.return_value = EmptyReport()
+        data = self.gql_request(query, variables=variables)
+        coverageFile = data["owner"]["repository"]["commit"]["coverageAnalytics"][
+            "coverageFile"
+        ]
+        assert coverageFile["content"] == fake_coverage["content"]
+        assert coverageFile["coverage"] == fake_coverage["coverage"]
+        assert coverageFile["totals"] == fake_coverage["totals"]
+        assert coverageFile["isCriticalFile"] == False
+
+    @patch("shared.reports.api_report_service.build_report_from_commit")
+    def test_coverage_flag_names(self, report_mock):
+        query = query_commit % "coverageAnalytics { flagNames }"
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "path": "path",
+        }
+        report_mock.return_value = MockReport()
+        data = self.gql_request(query, variables=variables)
+        flags = data["owner"]["repository"]["commit"]["coverageAnalytics"]["flagNames"]
+        assert flags == ["flag_a", "flag_b"]
+
+    def test_coverage_bundle_analysis_missing_report(self):
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisReport {
+                    __typename
+                    ... on MissingHeadReport {
+                        message
+                    }
+                }
+            }
+            """
+        )
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "MissingHeadReport",
+            "message": "Missing head report",
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_coverage_bundle_analysis_report(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundles {
+                                                name
+                                                assets {
+                                                    normalizedName
+                                                }
+                                                asset(name: "not_exist") {
+                                                    normalizedName
+                                                }
+                                                bundleData {
+                                                    loadTime {
+                                                        threeG
+                                                        highSpeed
+                                                    }
+                                                    size {
+                                                        gzip
+                                                        uncompress
+                                                    }
+                                                }
+                                                isCached
+                                            }
+                                            bundleData {
+                                                loadTime {
+                                                    threeG
+                                                    highSpeed
+                                                }
+                                                size {
+                                                    gzip
+                                                    uncompress
+                                                }
+                                            }
+                                            bundle(name: "not_exist") {
+                                                name
+                                                isCached
+                                            }
+                                            isCached
+                                        }
+                                        ... on MissingHeadReport {
+                                            message
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundles": [
+                {
+                    "name": "b1",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 0,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 20,
+                        },
+                    },
+                    "isCached": False,
+                },
+                {
+                    "name": "b2",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 2,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 200,
+                        },
+                    },
+                    "isCached": False,
+                },
+                {
+                    "name": "b3",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 16,
+                            "highSpeed": 0,
+                        },
+                        "size": {
+                            "gzip": 0,
+                            "uncompress": 1500,
+                        },
+                    },
+                    "isCached": False,
+                },
+                {
+                    "name": "b5",
+                    "assets": [
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/index-*.js"},
+                        {"normalizedName": "assets/LazyComponent-*.js"},
+                        {"normalizedName": "assets/index-*.css"},
+                        {"normalizedName": "assets/react-*.svg"},
+                    ],
+                    "asset": None,
+                    "bundleData": {
+                        "loadTime": {
+                            "threeG": 2133,
+                            "highSpeed": 53,
+                        },
+                        "size": {
+                            "gzip": 200,
+                            "uncompress": 200000,
+                        },
+                    },
+                    "isCached": False,
+                },
+            ],
+            "bundleData": {
+                "loadTime": {
+                    "threeG": 2151,
+                    "highSpeed": 53,
+                },
+                "size": {
+                    "gzip": 201,
+                    "uncompress": 201720,
+                },
+            },
+            "bundle": None,
+            "isCached": False,
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_coverage_bundle_analysis_compare(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        base_commit_report = CommitReportFactory(
+            commit=self.parent_commit,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=base_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = (
+            query_commit
+            % """
+            bundleAnalysis {
+                bundleAnalysisCompareWithParent {
+                    __typename
+                    ... on BundleAnalysisComparison {
+                        bundles {
+                            name
+                            changeType
+                            bundleData {
+                                size {
+                                    uncompress
+                                }
+                            }
+                            bundleChange {
+                                size {
+                                    uncompress
+                                }
+                            }
+                        }
+                        bundleData {
+                            size {
+                                uncompress
+                            }
+                        }
+                        bundleChange {
+                            size {
+                                uncompress
+                            }
+                        }
+                    }
+                }
+            }
+            """
+        )
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["bundleAnalysis"]["bundleAnalysisCompareWithParent"] == {
+            "__typename": "BundleAnalysisComparison",
+            "bundles": [
+                {
+                    "name": "b1",
+                    "changeType": "changed",
+                    "bundleData": {"size": {"uncompress": 20}},
+                    "bundleChange": {"size": {"uncompress": 5}},
+                },
+                {
+                    "name": "b2",
+                    "changeType": "changed",
+                    "bundleData": {"size": {"uncompress": 200}},
+                    "bundleChange": {"size": {"uncompress": 50}},
+                },
+                {
+                    "name": "b3",
+                    "changeType": "added",
+                    "bundleData": {"size": {"uncompress": 1500}},
+                    "bundleChange": {"size": {"uncompress": 1500}},
+                },
+                {
+                    "name": "b5",
+                    "changeType": "changed",
+                    "bundleData": {"size": {"uncompress": 200000}},
+                    "bundleChange": {"size": {"uncompress": 50000}},
+                },
+                {
+                    "name": "b4",
+                    "changeType": "removed",
+                    "bundleData": {"size": {"uncompress": 0}},
+                    "bundleChange": {"size": {"uncompress": -15000}},
+                },
+            ],
+            "bundleData": {"size": {"uncompress": 201720}},
+            "bundleChange": {"size": {"uncompress": 36555}},
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_size_filtered(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        with open(
+            "./services/tests/samples/head_bundle_report_with_gzip_size.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!, $bundleFilters: BundleReportFilters) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name:"b1") {
+                                                name
+                                                bundleDataFiltered(filters: $bundleFilters) {
+                                                    size {
+                                                        gzip
+                                                        uncompress
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "bundleFilters": {"reportGroup": "JAVASCRIPT"},
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "name": "b1",
+                "bundleDataFiltered": {"size": {"gzip": 6, "uncompress": 6}},
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_size_filtered_no_value(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+        with open(
+            "./services/tests/samples/head_bundle_report_with_gzip_size.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!, $bundleFilters: BundleReportFilters) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name:"b1") {
+                                                name
+                                                bundleDataFiltered(filters: $bundleFilters) {
+                                                    size {
+                                                        gzip
+                                                        uncompress
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+            "bundleFilters": {},
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+        assert commit["bundleAnalysis"]["bundleAnalysisReport"] == {
+            "__typename": "BundleAnalysisReport",
+            "bundle": {
+                "name": "b1",
+                "bundleDataFiltered": {"size": {"gzip": 20, "uncompress": 20}},
+            },
+        }
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_asset_routes(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open(
+            "./services/tests/samples/bundle_with_asset_routes.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "@codecov/example-sveltekit-app-client-esm") {
+                                                assets {
+                                                    name
+                                                    normalizedName
+                                                    routes
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        asset_reports = commit["bundleAnalysis"]["bundleAnalysisReport"]["bundle"][
+            "assets"
+        ]
+
+        assert asset_reports == [
+            {
+                "name": "_app/immutable/assets/svelte-welcome.VNiyy3gC.png",
+                "normalizedName": "_app/immutable/assets/svelte-welcome.*.png",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/svelte-welcome.0pIiHnVF.webp",
+                "normalizedName": "_app/immutable/assets/svelte-welcome.*.webp",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-all-400-normal.B2mvLtSD.woff",
+                "normalizedName": "_app/immutable/assets/fira-mono-all-400-normal.*.woff",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/chunks/entry.BaWB2kHj.js",
+                "normalizedName": "_app/immutable/chunks/entry.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/4.CcjRtXvw.js",
+                "normalizedName": "_app/immutable/nodes/4.*.js",
+                "routes": ["/sverdle"],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-latin-400-normal.DKjLVgQi.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-latin-400-normal.*.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-cyrillic-ext-400-normal.B04YIrm4.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-cyrillic-ext-400-normal.*.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-latin-ext-400-normal.D6XfiR-_.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-latin-ext-400-normal.D6XfiR-_.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-greek-400-normal.C3zng6O6.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-greek-400-normal.*.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-cyrillic-400-normal.36-45Uyg.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-cyrillic-400-normal.*.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/0.CL_S-12h.js",
+                "normalizedName": "_app/immutable/nodes/0.CL_S-12h.js",
+                "routes": ["/"],
+            },
+            {
+                "name": "_app/immutable/assets/fira-mono-greek-ext-400-normal.CsqI23CO.woff2",
+                "normalizedName": "_app/immutable/assets/fira-mono-greek-ext-400-normal.*.woff2",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/chunks/index.DDRweiI9.js",
+                "normalizedName": "_app/immutable/chunks/index.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/entry/app.Dd9ByE1Q.js",
+                "normalizedName": "_app/immutable/entry/app.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/2.BMQFqo-e.js",
+                "normalizedName": "_app/immutable/nodes/2.*.js",
+                "routes": ["/"],
+            },
+            {
+                "name": "_app/immutable/assets/0.CT0x_Q5c.css",
+                "normalizedName": "_app/immutable/assets/0.CT0x_Q5c.css",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/4.DOkkq0IA.css",
+                "normalizedName": "_app/immutable/assets/4.*.css",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/5.CwxmUzn6.js",
+                "normalizedName": "_app/immutable/nodes/5.*.js",
+                "routes": ["/sverdle/how-to-play"],
+            },
+            {
+                "name": "_app/immutable/chunks/scheduler.Dk-snqIU.js",
+                "normalizedName": "_app/immutable/chunks/scheduler.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/3.BqQOub2U.js",
+                "normalizedName": "_app/immutable/nodes/3.*.js",
+                "routes": ["/about"],
+            },
+            {
+                "name": "_app/immutable/assets/2.Cs8KR-Bb.css",
+                "normalizedName": "_app/immutable/assets/2.*.css",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/nodes/1.stWWSe4n.js",
+                "normalizedName": "_app/immutable/nodes/1.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/assets/5.CU6psp88.css",
+                "normalizedName": "_app/immutable/assets/5.*.css",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/chunks/index.Ice1EKvx.js",
+                "normalizedName": "_app/immutable/chunks/index.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/chunks/stores.BrqGIpx3.js",
+                "normalizedName": "_app/immutable/chunks/stores.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/entry/start.B1Q1eB84.js",
+                "normalizedName": "_app/immutable/entry/start.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/immutable/chunks/index.R8ovVqwX.js",
+                "normalizedName": "_app/immutable/chunks/index.*.js",
+                "routes": [],
+            },
+            {
+                "name": "_app/version.json",
+                "normalizedName": "_app/version.json",
+                "routes": [],
+            },
+        ]
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_report_info(self, get_storage_service):
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        head_commit_report = CommitReportFactory(
+            commit=self.commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        with open(
+            "./services/tests/samples/bundle_with_assets_and_modules.sqlite", "rb"
+        ) as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repo),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                bundleAnalysis {
+                                    bundleAnalysisReport {
+                                        __typename
+                                        ... on BundleAnalysisReport {
+                                            bundle(name: "b5") {
+                                                info {
+                                                    version
+                                                    pluginName
+                                                    pluginVersion
+                                                    builtAt
+                                                    duration
+                                                    bundlerName
+                                                    bundlerVersion
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": self.commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        bundle_info = commit["bundleAnalysis"]["bundleAnalysisReport"]["bundle"]["info"]
+
+        assert bundle_info["version"] == "1"
+        assert bundle_info["pluginName"] == "codecov-vite-bundle-analysis-plugin"
+        assert bundle_info["pluginVersion"] == "1.0.0"
+        assert bundle_info["builtAt"] == "2023-12-01 17:17:28.604000"
+        assert bundle_info["duration"] == 331
+        assert bundle_info["bundlerName"] == "rollup"
+        assert bundle_info["bundlerVersion"] == "3.29.4"
+
+    def test_latest_upload_error(self):
+        commit = CommitFactory(repository=self.repo)
+        report = CommitReportFactory(
+            commit=commit, report_type=CommitReport.ReportType.TEST_RESULTS
+        )
+        upload = UploadFactory(report=report)
+        UploadErrorFactory(
+            report_session=upload,
+            error_code=UploadErrorEnum.UNKNOWN_PROCESSING,
+            error_params={"error_message": "Unknown processing error"},
+        )
+
+        query = """
+            query FetchCommit($org: String!, $repo: String!, $commit: String!) {
+                owner(username: $org) {
+                    repository(name: $repo) {
+                        ... on Repository {
+                            commit(id: $commit) {
+                                latestUploadError {
+                                    errorCode
+                                    errorMessage
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        """
+
+        variables = {
+            "org": self.org.username,
+            "repo": self.repo.name,
+            "commit": commit.commitid,
+        }
+        data = self.gql_request(query, variables=variables)
+        commit = data["owner"]["repository"]["commit"]
+
+        assert commit["latestUploadError"] == {
+            "errorCode": "UNKNOWN_PROCESSING",
+            "errorMessage": "Unknown processing error",
+        }

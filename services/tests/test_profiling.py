@@ -1,13 +1,12 @@
 import json
-import re
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import minio
 from django.test import TestCase
+from shared.django_apps.core.tests.factories import CommitFactory, RepositoryFactory
 from shared.profiling import ProfilingSummaryDataAnalyzer
 
-from core.tests.factories import CommitFactory, RepositoryFactory
 from profiling.tests.factories import ProfilingCommitFactory
 from services.profiling import ProfilingSummary
 
@@ -107,9 +106,9 @@ class ProfilingSummaryTests(TestCase):
 
     def test_summary_data_not_summarized(self):
         pc = ProfilingCommitFactory(repository=self.repo)
-        assert self.service.summary_data(pc) == None
+        assert self.service.summary_data(pc) is None
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_summary_data_not_found(self, read_file):
         read_file.side_effect = [
             minio.error.S3Error(
@@ -127,9 +126,9 @@ class ProfilingSummaryTests(TestCase):
             last_summarized_at=datetime.now(),
         )
 
-        assert self.service.summary_data(pc) == None
+        assert self.service.summary_data(pc) is None
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_summary_data(self, read_file):
         read_file.return_value = test_summary
         pc = ProfilingCommitFactory(
@@ -213,7 +212,7 @@ class ProfilingSummaryTests(TestCase):
             ownerid=self.repo.author.ownerid,
         )
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     @patch("services.profiling.UserYaml.get_final_yaml")
     @patch("services.profiling.ProfilingSummary.summary_data")
     @patch("services.profiling.ProfilingSummary.latest_profiling_commit")
@@ -248,7 +247,7 @@ class ProfilingSummaryTests(TestCase):
         )
         mocked_reportservice.assert_called()
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     @patch("services.profiling.UserYaml.get_final_yaml")
     @patch("services.profiling.ProfilingSummary.summary_data")
     @patch("services.profiling.ProfilingSummary.latest_profiling_commit")
@@ -293,7 +292,7 @@ class ProfilingSummaryTests(TestCase):
         )
         mocked_reportservice.assert_called()
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     @patch("services.profiling.UserYaml.get_final_yaml")
     @patch("services.profiling.ProfilingSummary.summary_data")
     @patch("services.profiling.ProfilingSummary.latest_profiling_commit")
@@ -327,7 +326,7 @@ class ProfilingSummaryTests(TestCase):
         mocked_useryaml.assert_called()
         mocked_reportservice.assert_called()
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     @patch("services.profiling.UserYaml.get_final_yaml")
     @patch("services.profiling.ProfilingSummary.summary_data")
     @patch("services.profiling.ProfilingSummary.latest_profiling_commit")
@@ -371,7 +370,7 @@ class ProfilingSummaryTests(TestCase):
             "src/critical/very_important.json",
         ]
 
-    @patch("services.report.build_report_from_commit")
+    @patch("shared.reports.api_report_service.build_report_from_commit")
     @patch("services.profiling.UserYaml.get_final_yaml")
     @patch("services.profiling.ProfilingSummary.summary_data")
     @patch("services.profiling.ProfilingSummary.latest_profiling_commit")

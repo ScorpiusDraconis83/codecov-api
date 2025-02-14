@@ -2,11 +2,14 @@ from unittest.mock import PropertyMock, patch
 
 from rest_framework import status
 from rest_framework.test import APITestCase
+from shared.django_apps.core.tests.factories import (
+    BranchFactory,
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.reports.resources import Report, ReportFile, Session, SessionType
 from shared.reports.types import ReportLine, ReportTotals
-
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import BranchFactory, CommitFactory, RepositoryFactory
 
 
 def sample_report():
@@ -250,9 +253,7 @@ class TestBadgeHandler(APITestCase):
 
     def test_unknown_bagde_no_branch(self):
         gh_owner = OwnerFactory(service="github")
-        repo = RepositoryFactory(
-            author=gh_owner, active=True, private=False, name="repo1"
-        )
+        RepositoryFactory(author=gh_owner, active=True, private=False, name="repo1")
         response = self._get(
             kwargs={
                 "service": "gh",
@@ -296,7 +297,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        branch = BranchFactory(repository=repo, name="master")
+        BranchFactory(repository=repo, name="master")
         response = self._get(
             kwargs={
                 "service": "gh",
@@ -340,7 +341,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner, totals=None)
+        CommitFactory(repository=repo, author=gh_owner, totals=None)
         response = self._get(
             kwargs={
                 "service": "gh",
@@ -384,7 +385,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -435,7 +436,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -566,7 +567,7 @@ class TestBadgeHandler(APITestCase):
             name="repo1",
             image_token="12345678",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -616,7 +617,7 @@ class TestBadgeHandler(APITestCase):
             name="repo1",
             image_token="12345678",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -667,7 +668,7 @@ class TestBadgeHandler(APITestCase):
             image_token="12345678",
             branch="branch1",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         commit_2_totals = {
             "C": 0,
             "M": 0,
@@ -684,11 +685,15 @@ class TestBadgeHandler(APITestCase):
             "s": 1,
         }
         commit_2 = CommitFactory(
-            repository=repo, author=gh_owner, totals=commit_2_totals
+            commitid="b1c2b4fa3ae9ef615c8f740c5cba95d9851f9ae8",
+            repository=repo,
+            author=gh_owner,
+            totals=commit_2_totals,
         )
         branch_2 = BranchFactory(
             repository=repo, name="branch1", head=commit_2.commitid
         )
+
         # test default precision
         response = self._get_branch(
             kwargs={
@@ -728,6 +733,8 @@ class TestBadgeHandler(APITestCase):
         expected_badge = [line.strip() for line in expected_badge.split("\n")]
         assert expected_badge == badge
         assert response.status_code == status.HTTP_200_OK
+        branch_2.refresh_from_db()
+        assert branch_2.head == "b1c2b4fa3ae9ef615c8f740c5cba95d9851f9ae8"
 
     def test_badge_with_100_coverage(self):
         gh_owner = OwnerFactory(service="github")
@@ -739,7 +746,7 @@ class TestBadgeHandler(APITestCase):
             image_token="12345678",
             branch="branch1",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         commit_2_totals = {
             "C": 0,
             "M": 0,
@@ -758,9 +765,7 @@ class TestBadgeHandler(APITestCase):
         commit_2 = CommitFactory(
             repository=repo, author=gh_owner, totals=commit_2_totals
         )
-        branch_2 = BranchFactory(
-            repository=repo, name="branch1", head=commit_2.commitid
-        )
+        BranchFactory(repository=repo, name="branch1", head=commit_2.commitid)
         # test default precision
         response = self._get_branch(
             kwargs={
@@ -811,7 +816,7 @@ class TestBadgeHandler(APITestCase):
             image_token="12345678",
             branch="branch1",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         commit_2_totals = {
             "C": 0,
             "M": 0,
@@ -830,9 +835,7 @@ class TestBadgeHandler(APITestCase):
         commit_2 = CommitFactory(
             repository=repo, author=gh_owner, totals=commit_2_totals
         )
-        branch_2 = BranchFactory(
-            repository=repo, name="test/branch1", head=commit_2.commitid
-        )
+        BranchFactory(repository=repo, name="test/branch1", head=commit_2.commitid)
         # test default precision
         response = self._get_branch(
             kwargs={
@@ -879,7 +882,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = sample_report()
 
         # test default precision
@@ -893,7 +896,7 @@ class TestBadgeHandler(APITestCase):
             data={"flag": "unittests"},
         )
 
-        expected_badge = """<svg xmlns="http://www.w3.org/2000/svg" width="122" height="20"> 
+        expected_badge = """<svg xmlns="http://www.w3.org/2000/svg" width="122" height="20">
                 <linearGradient id="b" x2="0" y2="100%">
                     <stop offset="0" stop-color="#bbb" stop-opacity=".1" />
                     <stop offset="1" stop-opacity=".1" />
@@ -932,7 +935,7 @@ class TestBadgeHandler(APITestCase):
             name="repo1",
             branch="not-master",
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -982,7 +985,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = sample_report()
 
         # test default precision
@@ -1033,7 +1036,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = sample_report()
         # test default precision
         response = self._get(
@@ -1083,7 +1086,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = sample_report()
 
         # test default precision
@@ -1137,7 +1140,7 @@ class TestBadgeHandler(APITestCase):
             name="repo1",
             yaml={"coverage": {"range": [0.0, 0.8]}},
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -1188,7 +1191,7 @@ class TestBadgeHandler(APITestCase):
             name="repo1",
             yaml={"coverage": {}},
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -1236,7 +1239,7 @@ class TestBadgeHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = None
 
         # test default precision
@@ -1282,12 +1285,12 @@ class TestBadgeHandler(APITestCase):
         assert response.status_code == status.HTTP_200_OK
 
     @patch("core.models.Commit.full_report", new_callable=PropertyMock)
-    def test_commit_report_null(self, full_report_mock):
+    def test_commit_report_no_flags(self, full_report_mock):
         gh_owner = OwnerFactory(service="github")
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitFactory(repository=repo, author=gh_owner)
+        CommitFactory(repository=repo, author=gh_owner)
         full_report_mock.return_value = sample_report_no_flags()
 
         # test default precision

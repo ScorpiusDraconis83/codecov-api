@@ -2,18 +2,17 @@ from unittest.mock import patch
 
 from rest_framework import status
 from rest_framework.test import APITestCase
-
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import (
+from shared.django_apps.core.tests.factories import (
     BranchFactory,
     CommitFactory,
     CommitWithReportFactory,
+    OwnerFactory,
     PullFactory,
     RepositoryFactory,
 )
 
 
-@patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
+@patch("shared.api_archive.archive.ArchiveService.read_chunks", lambda obj, _: "")
 class TestGraphHandler(APITestCase):
     def _get(self, graph_type, kwargs={}, data={}):
         path = f"/{kwargs.get('service')}/{kwargs.get('owner_username')}/{kwargs.get('repo_name')}/graphs/{graph_type}.{kwargs.get('ext')}"
@@ -85,7 +84,7 @@ class TestGraphHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -128,7 +127,7 @@ class TestGraphHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -174,7 +173,7 @@ class TestGraphHandler(APITestCase):
         repo = RepositoryFactory(
             author=gh_owner, active=True, private=False, name="repo1"
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
 
         # test default precision
         response = self._get(
@@ -252,7 +251,7 @@ class TestGraphHandler(APITestCase):
 
     def test_private_repo_no_token(self):
         gh_owner = OwnerFactory(service="github")
-        repo = RepositoryFactory(
+        RepositoryFactory(
             author=gh_owner,
             active=True,
             private=True,
@@ -285,7 +284,7 @@ class TestGraphHandler(APITestCase):
             name="repo1",
             image_token="12345678",
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
 
         response = self._get(
             "sunburst",
@@ -328,9 +327,7 @@ class TestGraphHandler(APITestCase):
 
     def test_unkown_branch(self):
         gh_owner = OwnerFactory(service="github")
-        repo = RepositoryFactory(
-            author=gh_owner, active=True, private=False, name="repo1"
-        )
+        RepositoryFactory(author=gh_owner, active=True, private=False, name="repo1")
 
         response = self._get(
             "sunburst",
@@ -358,7 +355,7 @@ class TestGraphHandler(APITestCase):
             image_token="12345678",
             branch="branch1",
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
         commit_2_totals = {
             "C": 0,
             "M": 0,
@@ -377,9 +374,7 @@ class TestGraphHandler(APITestCase):
         commit_2 = CommitWithReportFactory(
             repository=repo, author=gh_owner, totals=commit_2_totals
         )
-        branch_2 = BranchFactory(
-            repository=repo, name="branch1", head=commit_2.commitid
-        )
+        BranchFactory(repository=repo, name="branch1", head=commit_2.commitid)
         # test default precision
         response = self._get_branch(
             "tree",
@@ -429,7 +424,7 @@ class TestGraphHandler(APITestCase):
 
         # make sure commit 2 report is different than commit 1 and
         # assert that the expected graph below still pertains to commit_1
-        commit_2 = CommitFactory(
+        CommitFactory(
             repository=repo,
             author=gh_owner,
             parent_commit_id=commit_1.commitid,
@@ -505,7 +500,7 @@ class TestGraphHandler(APITestCase):
             image_token="12345678",
             branch="branch1",
         )
-        pull = PullFactory(
+        PullFactory(
             pullid=10,
             repository_id=repo.repoid,
             _flare=[
@@ -562,7 +557,7 @@ class TestGraphHandler(APITestCase):
 
     def test_no_pull_graph(self):
         gh_owner = OwnerFactory(service="github")
-        repo = RepositoryFactory(
+        RepositoryFactory(
             author=gh_owner,
             active=True,
             private=True,
@@ -596,10 +591,10 @@ class TestGraphHandler(APITestCase):
             private=True,
             name="repo1",
             image_token="12345678",
-            branch="master",
+            branch="main",
         )
-        commit = CommitWithReportFactory(repository=repo, author=gh_owner)
-        pull = PullFactory(pullid=10, repository_id=repo.repoid, _flare=None)
+        CommitWithReportFactory(repository=repo, author=gh_owner)
+        PullFactory(pullid=10, repository_id=repo.repoid, _flare=None)
 
         # test default precision
         response = self._get_pull(
@@ -656,4 +651,37 @@ class TestGraphHandler(APITestCase):
         assert (
             response.data["detail"]
             == "Not found. Note: private repositories require ?token arguments"
+        )
+
+    @patch("shared.reports.api_report_service.build_report_from_commit")
+    def test_pull_file_not_found_in_storage(self, mocked_build_report):
+        mocked_build_report.return_value = None
+        gh_owner = OwnerFactory(service="github")
+        repo = RepositoryFactory(
+            author=gh_owner,
+            active=True,
+            private=True,
+            name="repo1",
+            image_token="12345678",
+            branch="main",
+        )
+        CommitWithReportFactory(repository=repo, author=gh_owner)
+        PullFactory(pullid=10, repository_id=repo.repoid, _flare=None)
+
+        response = self._get_pull(
+            "tree",
+            kwargs={
+                "service": "gh",
+                "owner_username": gh_owner.username,
+                "repo_name": "repo1",
+                "ext": "svg",
+                "pull": 10,
+            },
+            data={"token": "12345678"},
+        )
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert (
+            response.data["detail"]
+            == "Not found. Note: file for chunks not found in storage"
         )

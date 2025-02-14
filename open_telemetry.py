@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 from datetime import datetime
 
 import requests
@@ -132,27 +131,25 @@ class CodecovExporter(SpanExporter):
         api = self.attributes["api"]
 
         try:
-            to_send = []
+            to_send = [self._format_span(span) for span in spans]
             headers = {
                 "content-type": "application/json",
                 "Authorization": self.attributes["token"],
             }
-            for span in spans:
-                to_send.append(self._format_span(span))
             requests.post(api + "/api/ingest", headers=headers, json=to_send)
         except ConnectionError:
             logging.exception("failed to export all spans")
             return SpanExportResult.FAILURE
         except requests.HTTPError as e:
-            print(e)
-            logging.exception("HTTP server returned erroneous response")
+            logging.exception(
+                "HTTP server returned erroneous response", extra=dict(error=e)
+            )
             return SpanExportResult.FAILURE
         except requests.Timeout:
             logging.exception("request timed out")
             return SpanExportResult.FAILURE
         except Exception as e:
-            print(e)
-            logging.exception("request failed")
+            logging.exception("request failed", extra=dict(error=e))
             return SpanExportResult.FAILURE
 
         return SpanExportResult.SUCCESS

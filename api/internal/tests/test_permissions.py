@@ -2,15 +2,13 @@ from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 from rest_framework.exceptions import APIException
-from rest_framework.test import APIRequestFactory
+from shared.django_apps.core.tests.factories import OwnerFactory, RepositoryFactory
 
 from api.internal.tests.test_utils import (
     GetAdminErrorProviderAdapter,
     GetAdminProviderAdapter,
 )
 from api.shared.permissions import RepositoryPermissionsService, UserIsAdminPermissions
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import RepositoryFactory
 
 
 class MockedPermissionsAdapter:
@@ -96,6 +94,14 @@ class TestRepositoryPermissionsService(TestCase):
             owner = OwnerFactory(plan="users-inappy")
             user = OwnerFactory(organizations=[])
             assert self.permissions_service.user_is_activated(user, owner) is False
+
+    def test_user_is_activated_returns_false_if_owner_is_none(self):
+        user = OwnerFactory()
+        assert self.permissions_service.user_is_activated(user, None) is False
+
+    def test_user_is_activated_returns_false_if_user_is_none(self):
+        owner = OwnerFactory()
+        assert self.permissions_service.user_is_activated(None, owner) is False
 
     def test_user_is_activated_returns_true_when_owner_has_legacy_plan(self):
         user = OwnerFactory()
@@ -185,5 +191,5 @@ class TestUserIsAdminPermissions(TestCase):
         org = OwnerFactory()
         user = OwnerFactory()
 
-        with self.assertRaises(APIException) as e:
+        with self.assertRaises(APIException):
             self.permissions_class._is_admin_on_provider(user, org)

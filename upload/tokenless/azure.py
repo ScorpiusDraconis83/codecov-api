@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta
+from typing import Any, Dict
 
 import requests
 from requests.exceptions import ConnectionError, HTTPError
@@ -12,7 +13,7 @@ log = logging.getLogger(__name__)
 
 
 class TokenlessAzureHandler(BaseTokenlessUploadHandler):
-    def get_build(self):
+    def get_build(self) -> Dict[str, Any]:
         try:
             response = requests.get(
                 f"{self.server_uri}{self.project}/_apis/build/builds/{self.job}?api-version=5.0",
@@ -38,7 +39,7 @@ class TokenlessAzureHandler(BaseTokenlessUploadHandler):
             )
         try:
             build = response.json()
-        except (JSONDecodeError) as e:
+        except JSONDecodeError as e:
             log.warning(
                 f"Expected JSON in Azure response, got error {e} instead",
                 extra=dict(
@@ -54,8 +55,7 @@ class TokenlessAzureHandler(BaseTokenlessUploadHandler):
             )
         return build
 
-    def verify(self):
-
+    def verify(self) -> None:
         if not self.upload_params.get("job"):
             raise NotFound(
                 'Missing "job" argument. Please upload with the Codecov repository upload token to resolve issue.'
@@ -79,11 +79,16 @@ class TokenlessAzureHandler(BaseTokenlessUploadHandler):
         # Build should have finished within the last 4 mins OR should have an 'inProgress' flag
         if build["status"] == "completed":
             finishTimestamp = build["finishTime"].replace("T", " ").replace("Z", "")
+            # Azure DevOps API returns nanosecond precision (7 digits), but Python only supports
+            # microsecond precision (6 digits). Truncate to 6 digits after decimal.
+            if "." in finishTimestamp:
+                base, fraction = finishTimestamp.rsplit(".", 1)
+                finishTimestamp = f"{base}.{fraction[:6]}"
             buildFinishDateObj = datetime.strptime(
                 finishTimestamp, "%Y-%m-%d %H:%M:%S.%f"
             )
             finishTimeWithBuffer = buildFinishDateObj + timedelta(minutes=4)
-            now = datetime.utcnow()
+            now = datetime.now()
             if not now <= finishTimeWithBuffer:
                 raise NotFound(
                     "Azure build has already finished. Please upload with the Codecov repository upload token to resolve issue."

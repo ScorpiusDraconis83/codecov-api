@@ -1,13 +1,15 @@
 from datetime import datetime
 
+import pytest
 from django.http.cookie import SimpleCookie
 from django.urls import reverse
 from django.utils import timezone
+from shared.django_apps.core.tests.factories import OwnerFactory
+from shared.plan.constants import DEFAULT_FREE_PLAN
 from shared.torngit import GithubEnterprise
 from shared.torngit.exceptions import TorngitClientGeneralError
 
 from codecov_auth.models import Owner
-from codecov_auth.tests.factories import OwnerFactory
 
 
 def _get_state_from_redis(mock_redis):
@@ -15,6 +17,7 @@ def _get_state_from_redis(mock_redis):
     return key_redis.replace("oauth-state-", "")
 
 
+@pytest.mark.django_db
 def test_get_ghe_redirect(client, mocker, mock_redis, settings):
     mock_get_config = mocker.patch(
         "shared.torngit.github_enterprise.get_config",
@@ -33,8 +36,9 @@ def test_get_ghe_redirect(client, mocker, mock_redis, settings):
     mock_get_config.assert_called_with("github_enterprise", "url")
 
 
+@pytest.mark.django_db
 def test_get_ghe_redirect_with_ghpr_cookie(client, mocker, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -56,8 +60,9 @@ def test_get_ghe_redirect_with_ghpr_cookie(client, mocker, mock_redis, settings)
     assert ghpr_cooke.get("domain") == ".simple.site"
 
 
+@pytest.mark.django_db
 def test_get_github_redirect_with_private_url(client, mocker, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -79,7 +84,7 @@ def test_get_github_redirect_with_private_url(client, mocker, mock_redis, settin
 
 
 def test_get_ghe_already_with_code(client, mocker, db, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -155,6 +160,10 @@ def test_get_ghe_already_with_code(client, mocker, db, mock_redis, settings):
         ),
     )
 
+    session = client.session
+    session["github_enterprise_oauth_state"] = "abc"
+    session.save()
+
     url = reverse("ghe-login")
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/ghe")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
@@ -176,7 +185,7 @@ def test_get_ghe_already_with_code(client, mocker, db, mock_redis, settings):
     assert owner.root_parent_service_id is None
     assert not owner.staff
     assert owner.cache is None
-    assert owner.plan == "users-basic"
+    assert owner.plan == DEFAULT_FREE_PLAN
     assert owner.plan_provider is None
     assert owner.plan_user_count == 1
     assert owner.plan_auto_activate is True
@@ -206,7 +215,7 @@ def test_get_ghe_already_with_code(client, mocker, db, mock_redis, settings):
 def test_get_ghe_already_with_code_github_error(
     client, mocker, db, mock_redis, settings
 ):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -218,6 +227,9 @@ def test_get_ghe_already_with_code_github_error(
         raise TorngitClientGeneralError(403, "response", "message")
 
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/ghe")
+    session = client.session
+    session["github_enterprise_oauth_state"] = "abc"
+    session.save()
 
     mocker.patch.object(
         GithubEnterprise, "get_authenticated_user", side_effect=helper_func
@@ -231,7 +243,7 @@ def test_get_ghe_already_with_code_github_error(
 
 
 def test_state_not_known(client, mocker, db, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -244,7 +256,7 @@ def test_state_not_known(client, mocker, db, mock_redis, settings):
 
 
 def test_get_ghe_already_with_code_with_email(client, mocker, db, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -287,6 +299,9 @@ def test_get_ghe_already_with_code_with_email(client, mocker, db, mock_redis, se
             as_tuple=mocker.MagicMock(return_value=("a", "b"))
         ),
     )
+    session = client.session
+    session["github_enterprise_oauth_state"] = "abc"
+    session.save()
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/ghe")
     url = reverse("ghe-login")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
@@ -301,7 +316,7 @@ def test_get_ghe_already_with_code_with_email(client, mocker, db, mock_redis, se
 
 
 def test_get_ghe_already_owner_already_exist(client, mocker, db, mock_redis, settings):
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github_enterprise.get_config",
         side_effect=lambda *args: "https://my.githubenterprise.com",
     )
@@ -352,6 +367,9 @@ def test_get_ghe_already_owner_already_exist(client, mocker, db, mock_redis, set
         ),
     )
     url = reverse("ghe-login")
+    session = client.session
+    session["github_enterprise_oauth_state"] = "abc"
+    session.save()
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/ghe")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
     assert res.status_code == 302

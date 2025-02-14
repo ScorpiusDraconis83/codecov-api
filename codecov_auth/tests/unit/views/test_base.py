@@ -1,17 +1,22 @@
-from datetime import datetime, timedelta
-from unittest.mock import Mock, patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, call, patch
 
 import pytest
 from django.conf import settings
 from django.contrib.sessions.backends.cache import SessionStore
-from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.core.exceptions import PermissionDenied
 from django.http import HttpResponse
 from django.test import RequestFactory, TestCase, override_settings
 from freezegun import freeze_time
+from shared.django_apps.codecov_auth.tests.factories import (
+    OwnerFactory,
+    SessionFactory,
+    UserFactory,
+)
 from shared.license import LicenseInformation
 
-from codecov_auth.models import Owner, OwnerProfile
-from codecov_auth.tests.factories import OwnerFactory, UserFactory
+from codecov_auth.models import DjangoSession, Owner, OwnerProfile, Session
+from codecov_auth.tests.factories import DjangoSessionFactory
 from codecov_auth.views.base import LoginMixin, StateMixin
 
 
@@ -19,6 +24,7 @@ def set_up_mixin(to=None):
     query_string = {"to": to} if to else None
     mixin = StateMixin()
     mixin.request = RequestFactory().get("", query_string)
+    mixin.request.session = SessionStore()
     mixin.service = "github"
     return mixin
 
@@ -83,7 +89,7 @@ def test_generate_state_when_wrong_url(mock_redis):
     )
 
 
-def test_get_redirection_url_from_state_no_state(mock_redis):
+def test_get_redirection_url_from_state_without_redis_state(mock_redis):
     mixin = set_up_mixin()
     assert mixin.get_redirection_url_from_state("not exist") == (
         "http://localhost:3000/gh",
@@ -91,9 +97,34 @@ def test_get_redirection_url_from_state_no_state(mock_redis):
     )
 
 
+def test_get_redirection_url_from_state_without_session_state(mock_redis):
+    mixin = set_up_mixin()
+    state = "abc"
+    mock_redis.set(mixin._get_key_redis(state), "http://localhost/gh/codecov")
+    assert mixin.get_redirection_url_from_state(state) == (
+        "http://localhost:3000",
+        False,
+    )
+
+
+def test_get_redirection_url_from_state_with_session_state_mismatch(mock_redis):
+    mixin = set_up_mixin()
+    state = "abc"
+    mock_redis.set(mixin._get_key_redis(state), "http://localhost/gh/codecov")
+    mixin.request.session[mixin._session_key()] = "def"
+
+    assert mixin.get_redirection_url_from_state(state) == (
+        "http://localhost:3000",
+        False,
+    )
+
+
 def test_get_redirection_url_from_state_give_url(mock_redis):
     mixin = set_up_mixin()
-    mock_redis.set(f"oauth-state-abc", "http://localhost/gh/codecov")
+    state = "abc"
+    mock_redis.set(mixin._get_key_redis(state), "http://localhost/gh/codecov")
+    mixin.request.session[mixin._session_key()] = state
+
     assert mixin.get_redirection_url_from_state("abc") == (
         "http://localhost/gh/codecov",
         True,
@@ -102,22 +133,22 @@ def test_get_redirection_url_from_state_give_url(mock_redis):
 
 def test_remove_state_with_with_delay(mock_redis):
     mixin = set_up_mixin()
-    mock_redis.set(f"oauth-state-abc", "http://localhost/gh/codecov")
+    mock_redis.set("oauth-state-abc", "http://localhost/gh/codecov")
     mixin.remove_state("abc", delay=5)
     initial_datetime = datetime.now()
     with freeze_time(initial_datetime) as frozen_time:
-        assert mock_redis.get(f"oauth-state-abc") is not None
+        assert mock_redis.get("oauth-state-abc") is not None
         frozen_time.move_to(initial_datetime + timedelta(seconds=4))
-        assert mock_redis.get(f"oauth-state-abc") is not None
+        assert mock_redis.get("oauth-state-abc") is not None
         frozen_time.move_to(initial_datetime + timedelta(seconds=6))
-        assert mock_redis.get(f"oauth-state-abc") is None
+        assert mock_redis.get("oauth-state-abc") is None
 
 
 def test_remove_state_with_with_no_delay(mock_redis):
     mixin = set_up_mixin()
-    mock_redis.set(f"oauth-state-abc", "http://localhost/gh/codecov")
+    mock_redis.set("oauth-state-abc", "http://localhost/gh/codecov")
     mixin.remove_state("abc")
-    assert mock_redis.get(f"oauth-state-abc") is None
+    assert mock_redis.get("oauth-state-abc") is None
 
 
 class LoginMixinTests(TestCase):
@@ -143,6 +174,27 @@ class LoginMixinTests(TestCase):
         )
         user_signed_up_mock.assert_called_once()
 
+    @patch("shared.events.amplitude.AmplitudeEventPublisher.publish")
+    def test_get_or_create_calls_amplitude_user_created_when_owner_created(
+        self, amplitude_publish_mock
+    ):
+        self.mixin_instance._get_or_create_owner(
+            {
+                "user": {"id": 12345, "key": "4567", "login": "testuser"},
+                "has_private_access": False,
+            },
+            self.request,
+        )
+
+        owner = Owner.objects.get(service_id=12345, username="testuser")
+
+        amplitude_publish_mock.assert_has_calls(
+            [
+                call("User Created", {"user_ownerid": owner.ownerid}),
+                call("set_orgs", {"user_ownerid": owner.ownerid, "org_ids": []}),
+            ]
+        )
+
     @patch("services.analytics.AnalyticsService.user_signed_in")
     def test_get_or_create_calls_analytics_user_signed_in_when_owner_not_created(
         self, user_signed_in_mock
@@ -161,10 +213,34 @@ class LoginMixinTests(TestCase):
         )
         user_signed_in_mock.assert_called_once()
 
+    @patch("shared.events.amplitude.AmplitudeEventPublisher.publish")
+    def test_get_or_create_calls_amplitude_user_logged_in_when_owner_not_created(
+        self, amplitude_publish_mock
+    ):
+        owner = OwnerFactory(service_id=89, service="github", organizations=[1, 2])
+        self.mixin_instance._get_or_create_owner(
+            {
+                "user": {
+                    "id": owner.service_id,
+                    "key": "02or0sa",
+                    "login": owner.username,
+                },
+                "has_private_access": owner.private_access,
+            },
+            self.request,
+        )
+
+        amplitude_publish_mock.assert_has_calls(
+            [
+                call("User Logged in", {"user_ownerid": owner.ownerid}),
+                call("set_orgs", {"user_ownerid": owner.ownerid, "org_ids": [1, 2]}),
+            ]
+        )
+
     @override_settings(IS_ENTERPRISE=False)
     @patch("services.analytics.AnalyticsService.user_signed_in")
     def test_set_marketing_tags_on_cookies(self, user_signed_in_mock):
-        owner = OwnerFactory(service="github")
+        OwnerFactory(service="github")
         self.request = RequestFactory().get(
             "",
             {
@@ -206,9 +282,9 @@ class LoginMixinTests(TestCase):
     @patch("services.analytics.AnalyticsService.user_signed_in")
     def test_use_marketing_tags_from_cookies(self, user_signed_in_mock):
         owner = OwnerFactory(service_id=89, service="github")
-        self.request.COOKIES[
-            "_marketing_tags"
-        ] = "utm_department=a&utm_campaign=b&utm_medium=c&utm_source=d&utm_content=e&utm_term=f"
+        self.request.COOKIES["_marketing_tags"] = (
+            "utm_department=a&utm_campaign=b&utm_medium=c&utm_source=d&utm_content=e&utm_term=f"
+        )
         self.mixin_instance._get_or_create_owner(
             {
                 "user": {
@@ -376,7 +452,7 @@ class LoginMixinTests(TestCase):
             == 0
         )
         # If the number of users is larger than the limit, raise error
-        with pytest.raises(PermissionDenied) as exp:
+        with pytest.raises(PermissionDenied):
             OwnerFactory(service="github", ownerid=12, oauth_token="very-fake-token")
             OwnerFactory(service="github", ownerid=13, oauth_token=None)
             OwnerFactory(service="github", ownerid=14, oauth_token="very-fake-token")
@@ -399,7 +475,7 @@ class LoginMixinTests(TestCase):
         )
         mock_get_current_license.return_value = license
         # User doesn't exist, and existing users will raise error
-        with pytest.raises(PermissionDenied) as exp:
+        with pytest.raises(PermissionDenied):
             OwnerFactory(ownerid=1, service="github", plan_activated_users=[1, 2, 3])
             OwnerFactory(
                 ownerid=2,
@@ -703,3 +779,118 @@ class LoginMixinTests(TestCase):
         # does not re-claim owner
         assert owner.user is not None
         assert owner.user != user
+
+    @patch("services.refresh.RefreshService.trigger_refresh", lambda *args: None)
+    def test_login_owner_with_expired_login_session(self):
+        user = UserFactory()
+        owner = OwnerFactory(service="github", user=user)
+
+        another_user = UserFactory()
+        another_owner = OwnerFactory(service="github", user=another_user)
+
+        now = datetime.now(timezone.utc)
+
+        # Create a session that will be deleted
+        to_be_deleted_1 = SessionFactory(
+            owner=owner,
+            type="login",
+            name="to_be_deleted",
+            lastseen="2021-01-01T00:00:00+00:00",
+            login_session=DjangoSessionFactory(expire_date=now - timedelta(days=1)),
+        )
+        to_be_deleted_1_session_key = to_be_deleted_1.login_session.session_key
+
+        # Create a session that will not be deleted because its not a login session
+        to_be_kept_1 = SessionFactory(
+            owner=owner,
+            type="api",
+            name="to_be_kept",
+            lastseen="2021-01-01T00:00:00+00:00",
+            login_session=DjangoSessionFactory(expire_date=now + timedelta(days=1)),
+        )
+
+        # Create a session that will not be deleted because it's not expired
+        to_be_kept_2 = SessionFactory(
+            owner=owner,
+            type="login",
+            name="to_be_kept",
+            lastseen="2021-01-01T00:00:00+00:00",
+            login_session=DjangoSessionFactory(expire_date=now + timedelta(days=1)),
+        )
+
+        # Create a session that will not be deleted because it's not the owner's session
+        to_be_kept_3 = SessionFactory(
+            owner=another_owner,
+            type="login",
+            name="to_be_kept",
+            lastseen="2021-01-01T00:00:00+00:00",
+            login_session=DjangoSessionFactory(expire_date=now - timedelta(seconds=1)),
+        )
+
+        assert (
+            len(DjangoSession.objects.filter(session_key=to_be_deleted_1_session_key))
+            == 1
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_1.login_session.session_key
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_2.login_session.session_key
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_3.login_session.session_key
+                )
+            )
+            == 1
+        )
+
+        self.request.user = user
+        self.mixin_instance.login_owner(owner, self.request, HttpResponse())
+        owner.refresh_from_db()
+
+        new_login_session = Session.objects.filter(name=None)
+
+        assert len(new_login_session) == 1
+        assert len(Session.objects.filter(name="to_be_deleted").all()) == 0
+        assert len(Session.objects.filter(name="to_be_kept").all()) == 3
+
+        assert (
+            len(DjangoSession.objects.filter(session_key=to_be_deleted_1_session_key))
+            == 0
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_1.login_session.session_key
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_2.login_session.session_key
+                )
+            )
+            == 1
+        )
+        assert (
+            len(
+                DjangoSession.objects.filter(
+                    session_key=to_be_kept_3.login_session.session_key
+                )
+            )
+            == 1
+        )

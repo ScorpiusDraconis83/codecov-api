@@ -40,7 +40,7 @@ This service will startup when you run codecov.io normally. It is under that `ap
 The easiest way to run tests (that doesn't require installing postgres and other dependencies) is to run inside of docker:
 
     docker-compose up
-    docker exec -it codecov-api_api_1 pytest -rf
+    docker exec -it codecov-api_api_1 pytest -rf --no-migrations
 
 ### Testing standalone
 
@@ -79,7 +79,7 @@ Do not change `requirements.txt` directly.
 
 ### Formatting
 
-This project uses `black` for formatting.      
+This project uses `ruff` for formatting.      
 You can run the linter using the command `make lint`.
 
 ### Migrations

@@ -1,11 +1,9 @@
 import logging
-import os
 from datetime import datetime, timedelta
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Tuple
 
 import celery
-import sentry_sdk
-from celery import Celery, chain, group, signals, signature
+from celery import Celery, chain, group, signature
 from celery.canvas import Signature
 from django.conf import settings
 from sentry_sdk import set_tag
@@ -14,7 +12,7 @@ from shared import celery_config
 
 from core.models import Repository
 from services.task.task_router import route_task
-from timeseries.models import Dataset
+from timeseries.models import Dataset, MeasurementName
 
 celery_app = Celery("tasks")
 celery_app.config_from_object("shared.celery_config:BaseCeleryConfig")
@@ -136,6 +134,7 @@ class TaskService(object):
         commitid,
         report_type=None,
         report_code=None,
+        arguments=None,
         debug=False,
         rebuild=False,
         immutable=False,
@@ -147,6 +146,7 @@ class TaskService(object):
                 commitid=commitid,
                 report_type=report_type,
                 report_code=report_code,
+                arguments=arguments,
                 debug=debug,
                 rebuild=rebuild,
             ),
@@ -159,6 +159,7 @@ class TaskService(object):
         commitid,
         report_type=None,
         report_code=None,
+        arguments=None,
         countdown=0,
         debug=False,
         rebuild=False,
@@ -168,6 +169,7 @@ class TaskService(object):
             commitid,
             report_type=report_type,
             report_code=report_code,
+            arguments=arguments,
             debug=debug,
             rebuild=rebuild,
         ).apply_async(countdown=countdown)
@@ -200,6 +202,8 @@ class TaskService(object):
         sync_teams=True,
         sync_repos=True,
         using_integration=False,
+        manual_trigger=False,
+        repos_affected: Optional[List[Tuple[str, str]]] = None,
     ):
         """
         Send sync_teams and/or sync_repos task message
@@ -228,6 +232,8 @@ class TaskService(object):
                         ownerid=ownerid,
                         username=username,
                         using_integration=using_integration,
+                        manual_trigger=manual_trigger,
+                        repository_service_ids=repos_affected,
                     ),
                 )
             )
@@ -254,7 +260,7 @@ class TaskService(object):
         dataset_names: Iterable[str] = None,
     ):
         log.info(
-            f"Triggering timeseries backfill tasks for repo",
+            "Triggering timeseries backfill tasks for repo",
             extra=dict(
                 repoid=repository.pk,
                 start_date=start_date.isoformat(),
@@ -303,7 +309,7 @@ class TaskService(object):
         end_date: datetime,
     ):
         log.info(
-            f"Triggering dataset backfill",
+            "Triggering dataset backfill",
             extra=dict(
                 dataset_id=dataset.pk,
                 start_date=start_date.isoformat(),
@@ -322,7 +328,7 @@ class TaskService(object):
 
     def delete_timeseries(self, repository_id: int):
         log.info(
-            f"Delete repository timeseries data",
+            "Delete repository timeseries data",
             extra=dict(repository_id=repository_id),
         )
         self._create_signature(
@@ -378,14 +384,6 @@ class TaskService(object):
             ),
         ).apply_async()
 
-    def backfill_commit_data(self, commit_id: int):
-        self._create_signature(
-            "app.tasks.archive.BackfillCommitDataToStorage",
-            kwargs=dict(
-                commitid=commit_id,
-            ),
-        ).apply_async()
-
     def preprocess_upload(self, repoid, commitid, report_code):
         self._create_signature(
             "app.tasks.upload.PreProcessUpload",
@@ -397,15 +395,42 @@ class TaskService(object):
         ).apply_async()
 
     def send_email(
-        self, ownerid, template_name: str, from_addr: str, subject: str, **kwargs
+        self,
+        to_addr: str,
+        subject: str,
+        template_name: str,
+        from_addr: str | None = None,
+        **kwargs,
     ):
+        # Templates can be found in worker/templates
         self._create_signature(
             "app.tasks.send_email.SendEmail",
             kwargs=dict(
-                ownerid=ownerid,
+                to_addr=to_addr,
+                subject=subject,
                 template_name=template_name,
                 from_addr=from_addr,
-                subject=subject,
                 **kwargs,
             ),
+        ).apply_async()
+
+    def delete_component_measurements(self, repoid: int, component_id: str) -> None:
+        log.info(
+            "Delete component measurements data",
+            extra=dict(repository_id=repoid, component_id=component_id),
+        )
+        self._create_signature(
+            celery_config.timeseries_delete_task_name,
+            kwargs=dict(
+                repository_id=repoid,
+                measurement_only=True,
+                measurement_type=MeasurementName.COMPONENT_COVERAGE.value,
+                measurement_id=component_id,
+            ),
+        ).apply_async()
+
+    def cache_test_results_redis(self, repoid: int, branch: str) -> None:
+        self._create_signature(
+            celery_config.cache_test_rollups_redis_task_name,
+            kwargs=dict(repoid=repoid, branch=branch),
         ).apply_async()

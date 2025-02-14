@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -98,7 +98,7 @@ class BaseReportViewSet(
             component = next(
                 (
                     component
-                    for component in commit_components(commit, self.request.user)
+                    for component in commit_components(commit, self.owner)
                     if component.component_id == component_id
                 ),
                 None,

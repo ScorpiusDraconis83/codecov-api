@@ -2,6 +2,7 @@ import math
 from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
+import sentry_sdk
 from django.conf import settings
 from django.db import connections
 from django.db.models import (
@@ -21,15 +22,12 @@ from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast
 from django.utils import timezone
 
-import services.report as report_service
 from codecov_auth.models import Owner
 from core.models import Commit, Repository
-from reports.models import RepositoryFlag
 from services.task import TaskService
 from timeseries.models import (
     Dataset,
     Interval,
-    Measurement,
     MeasurementName,
     MeasurementSummary,
 )
@@ -41,6 +39,7 @@ interval_deltas = {
 }
 
 
+@sentry_sdk.trace
 def refresh_measurement_summaries(start_date: datetime, end_date: datetime) -> None:
     """
     Refresh the measurement summaries for the given time range.
@@ -58,6 +57,7 @@ def refresh_measurement_summaries(start_date: datetime, end_date: datetime) -> N
             cursor.execute(sql)
 
 
+@sentry_sdk.trace
 def aggregate_measurements(
     queryset: QuerySet, group_by: Iterable[str] = None
 ) -> QuerySet:
@@ -102,6 +102,7 @@ def _filter_repos(
     return queryset
 
 
+@sentry_sdk.trace
 def coverage_measurements(
     interval: Interval,
     start_date: Optional[datetime] = None,
@@ -193,6 +194,7 @@ def aligned_start_date(interval: Interval, date: datetime) -> datetime:
     return aligning_date + (intervals_before * delta)
 
 
+@sentry_sdk.trace
 def fill_sparse_measurements(
     measurements: Iterable[dict],
     interval: Interval,
@@ -257,6 +259,7 @@ def fill_sparse_measurements(
     return intervals
 
 
+@sentry_sdk.trace
 def coverage_fallback_query(
     interval: Interval,
     start_date: Optional[datetime] = None,
@@ -324,6 +327,7 @@ def _commits_coverage(
     )
 
 
+@sentry_sdk.trace
 def repository_coverage_measurements_with_fallback(
     repository: Repository,
     interval: Interval,
@@ -357,11 +361,12 @@ def repository_coverage_measurements_with_fallback(
     else:
         if settings.TIMESERIES_ENABLED and not dataset:
             # we need to backfill
-            dataset = Dataset.objects.create(
+            dataset, created = Dataset.objects.get_or_create(
                 name=MeasurementName.COVERAGE.value,
                 repository_id=repository.pk,
             )
-            trigger_backfill(dataset)
+            if created:
+                trigger_backfill(dataset)
 
         # we're still backfilling or timeseries is disabled
         return coverage_fallback_query(
@@ -373,6 +378,7 @@ def repository_coverage_measurements_with_fallback(
         )
 
 
+@sentry_sdk.trace
 def owner_coverage_measurements_with_fallback(
     owner: Owner,
     repo_ids: Iterable[str],
@@ -412,7 +418,7 @@ def owner_coverage_measurements_with_fallback(
     else:
         if settings.TIMESERIES_ENABLED:
             # we need to backfill some datasets
-            dataset_repo_ids = set(dataset.repository_id for dataset in datasets)
+            dataset_repo_ids = {dataset.repository_id for dataset in datasets}
             missing_dataset_repo_ids = set(repo_ids) - dataset_repo_ids
             created_datasets = Dataset.objects.bulk_create(
                 [

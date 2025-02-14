@@ -9,16 +9,20 @@ import minio
 import pytest
 import pytz
 from django.test import TestCase
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
+from shared.reports.api_report_service import SerializableReport
 from shared.reports.resources import ReportFile
 from shared.reports.types import ReportTotals
 from shared.utils.merge import LineType
 
-from codecov_auth.tests.factories import OwnerFactory
 from compare.models import CommitComparison
 from compare.tests.factories import CommitComparisonFactory
 from core.models import Commit
-from core.tests.factories import CommitFactory, PullFactory, RepositoryFactory
-from reports.models import ReportDetails
 from reports.tests.factories import CommitReportFactory
 from services.comparison import (
     CommitComparisonService,
@@ -32,10 +36,10 @@ from services.comparison import (
     LineComparison,
     MissingComparisonReport,
     PullRequestComparison,
+    Segment,
 )
-from services.report import SerializableReport
 
-# Pulled from core.tests.factories.CommitFactory files.
+# Pulled from shared.django_apps.core.tests.factories.CommitFactory files.
 # Contents don't actually matter, it's just for providing a format
 # compatible with what SerializableReport expects. Used in
 # ComparisonTests.
@@ -141,7 +145,7 @@ class FileComparisonTraverseManagerTests(TestCase):
 
     def test_pop_line_returns_none_if_no_diff_or_src(self):
         manager = FileComparisonTraverseManager()
-        assert manager.pop_line() == None
+        assert manager.pop_line() is None
 
     def test_pop_line_pops_first_line_in_segment_if_traversing_that_segment(self):
         expected_line_value = "+this is a line!"
@@ -244,7 +248,7 @@ class FileComparisonTraverseManagerTests(TestCase):
         manager.apply([visitor])
         assert visitor.line_numbers == [(1, 1), (2, 2), (3, None), (None, 3)]
 
-    def test_can_traverse_diff_with_difflike_lines(self):
+    def test_can_traverse_diff_with_diff_like_lines(self):
         src = [
             "- line 1",  # not part of diff
             "- line 2",  # not part of diff
@@ -371,7 +375,7 @@ class LineComparisonTests(TestCase):
         lc = LineComparison(None, [0, "", [], 0, 0], base_ln, head_ln, "+", False)
         assert lc.number == {"base": base_ln, "head": head_ln}
 
-    def test_number_shows_none_for_base_if_minux_not_part_of_diff(self):
+    def test_number_shows_none_for_base_if_minus_not_part_of_diff(self):
         base_ln = 3
         head_ln = 4
         lc = LineComparison(None, [0, "", [], 0, 0], base_ln, head_ln, "-", False)
@@ -451,16 +455,16 @@ class LineComparisonTests(TestCase):
 
     def test_hit_session_ids_no_coverage(self):
         lc = LineComparison(None, [0, "", [[0, 0, 0, 0, 0]], 0, 0], 0, 0, "", False)
-        assert lc.hit_session_ids == None
+        assert lc.hit_session_ids is None
 
     def test_hit_session_ids_no_head_line(self):
         lc = LineComparison(None, None, 0, 0, "", False)
-        assert lc.hit_session_ids == None
+        assert lc.hit_session_ids is None
 
 
 class FileComparisonConstructorTests(TestCase):
     def test_constructor_no_keyError_if_diff_data_segements_is_missing(self):
-        file_comp = FileComparison(
+        FileComparison(
             head_file=ReportFile("file1"), base_file=ReportFile("file1"), diff_data={}
         )
 
@@ -542,7 +546,7 @@ class FileComparisonTests(TestCase):
         self.file_comparison.diff_data = {"stats": expected_stats}
         assert self.file_comparison.stats == expected_stats
 
-    def test_lines_returns_emptylist_if_no_diff_or_src(self):
+    def test_lines_returns_empty_list_if_no_diff_or_src(self):
         assert self.file_comparison.lines == []
 
     # essentially a smoke/integration test
@@ -988,7 +992,7 @@ class PullRequestComparisonTests(TestCase):
     @patch("redis.Redis.get")
     def test_files_with_changes_returns_none_if_no_files_with_changes(self, mocked_get):
         mocked_get.return_value = None
-        assert self.comparison._files_with_changes == None
+        assert self.comparison._files_with_changes is None
 
     @patch("redis.Redis.get")
     def test_files_with_changes_doesnt_crash_if_redis_connection_problem(
@@ -1125,41 +1129,6 @@ class PullRequestComparisonTests(TestCase):
             comparison = PullRequestComparison(owner, pull)
             assert comparison.is_pseudo_comparison is False
 
-    @patch("services.comparison.get_config")
-    def test_allow_coverage_offsets(self, get_config_mock):
-        owner = OwnerFactory()
-        repository = RepositoryFactory(author=owner)
-        pull = PullFactory(
-            pullid=44,
-            repository=repository,
-            compared_to=CommitFactory(repository=repository).commitid,
-            head=CommitFactory(repository=repository).commitid,
-            base=CommitFactory(repository=repository).commitid,
-        )
-
-        with self.subTest("returns result in repo yaml if exists"):
-            repository.yaml = {"codecov": {"allow_coverage_offsets": True}}
-            repository.save()
-            comparison = PullRequestComparison(owner, pull)
-            assert comparison.allow_coverage_offsets is True
-
-            repository.yaml = {"codecov": {"allow_coverage_offsets": False}}
-            repository.save()
-            comparison = PullRequestComparison(owner, pull)
-            assert comparison.allow_coverage_offsets is False
-
-        repository.yaml = None
-        repository.save()
-
-        with self.subTest("returns app settings value if exists, True if not"):
-            get_config_mock.return_value = True
-            comparison = PullRequestComparison(owner, pull)
-            comparison.allow_coverage_offsets is True
-
-            get_config_mock.return_value = False
-            comparison = PullRequestComparison(owner, pull)
-            comparison.allow_coverage_offsets is False
-
     @patch("services.repo_providers.RepoProviderService.get_adapter")
     def test_pseudo_diff_returns_diff_between_base_and_compared_to(
         self, get_adapter_mock
@@ -1262,14 +1231,14 @@ class PullRequestComparisonTests(TestCase):
 
 
 @patch("services.comparison.Comparison.git_comparison", new_callable=PropertyMock)
-@patch("services.report.build_report_from_commit")
+@patch("shared.reports.api_report_service.build_report_from_commit")
 class ComparisonHeadReportTests(TestCase):
     def setUp(self):
         owner = OwnerFactory()
         base, head = CommitFactory(author=owner), CommitFactory(author=owner)
         self.comparison = Comparison(base, head, owner)
 
-    @patch("services.report.SerializableReport.apply_diff")
+    @patch("shared.reports.api_report_service.SerializableReport.apply_diff")
     def test_head_report_calls_apply_diff(
         self, apply_diff_mock, build_report_from_commit_mock, git_comparison_mock
     ):
@@ -1318,22 +1287,6 @@ class ComparisonHasUnmergedBaseCommitsTests(TestCase):
         self.comparison = Comparison(user=owner, base_commit=base, head_commit=head)
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    def test_returns_true_if_reverse_comparison_has_commits(self, get_adapter_mock):
-        commits = ["a", "b"]
-        get_adapter_mock.return_value = (
-            ComparisonHasUnmergedBaseCommitsTests.MockFetchDiffCoro(commits)
-        )
-        assert self.comparison.has_unmerged_base_commits is True
-
-    def test_returns_false_if_reverse_comparison_has_one_commit_or_less(
-        self, get_adapter_mock
-    ):
-        commits = ["a"]
-        get_adapter_mock.return_value = (
-            ComparisonHasUnmergedBaseCommitsTests.MockFetchDiffCoro(commits)
-        )
-        assert self.comparison.has_unmerged_base_commits is False
-
 
 class SegmentTests(TestCase):
     def _report_lines(self, hits):
@@ -1345,7 +1298,7 @@ class SegmentTests(TestCase):
         ]
 
     def _src(self, n):
-        return [f"line{i+1}" for i in range(n)]
+        return [f"line{i + 1}" for i in range(n)]
 
     def setUp(self):
         self.file_comparison = FileComparison(
@@ -1685,7 +1638,7 @@ class ComparisonReportTest(TestCase):
         impacted_files = self.comparison_report_without_storage.impacted_files
         assert impacted_files == []
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_impacted_files_error_when_failing_to_get_file_from_storage(
         self, mock_read_file
     ):
@@ -1693,19 +1646,19 @@ class ComparisonReportTest(TestCase):
         impacted_files = self.comparison_report.impacted_files
         assert impacted_files == []
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_impacted_file(self, read_file):
         read_file.return_value = mock_data_from_archive
         impacted_file = self.comparison_report.impacted_file("fileB")
         assert impacted_file.head_name == "fileB"
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_impacted_files_filtered_by_indirect_changes(self, read_file):
         read_file.return_value = mock_data_from_archive
         impacted_files = self.comparison_report.impacted_files_with_unintended_changes
         assert [file.head_name for file in impacted_files] == ["fileA"]
 
-    @patch("services.archive.ArchiveService.read_file")
+    @patch("shared.api_archive.archive.ArchiveService.read_file")
     def test_impacted_files_filtered_by_direct_changes(self, read_file):
         read_file.return_value = mocked_files_with_direct_and_indirect_changes
         impacted_files = self.comparison_report.impacted_files_with_direct_changes
@@ -1832,6 +1785,21 @@ class ComparisonReportTest(TestCase):
         )
         assert file.has_changes is True
 
+    def test_remove_unintended_changes(self):
+        lines = [
+            LineComparison([1, "", [], 0, 0], [1, "", [], 0, 0], 1, 1, "line1", False),
+            LineComparison([1, "", [], 0, 0], [0, "", [], 0, 0], 2, 2, "line2", False),
+            LineComparison(None, [0, "", [], 0, 0], None, 3, "+line3", True),
+            LineComparison([0, "", [], 0, 0], None, 4, None, "-line4", True),
+            LineComparison([1, "", [], 0, 0], [0, "", [], 0, 0], 5, 5, "line5", False),
+        ]
+
+        segment = Segment(lines)
+        segment.remove_unintended_changes()
+
+        assert len(segment.lines) == 3
+        assert [line.value for line in segment.lines] == ["line1", "+line3", "-line4"]
+
 
 class CommitComparisonTests(TestCase):
     def setUp(self):
@@ -1839,14 +1807,6 @@ class CommitComparisonTests(TestCase):
         self.compare_commit = CommitFactory(updatestamp=datetime(2023, 1, 1))
         self.base_commit_report = CommitReportFactory(commit=self.base_commit)
         self.compare_commit_report = CommitReportFactory(commit=self.compare_commit)
-        self.base_report_details = ReportDetails.objects.create(
-            report_id=self.base_commit_report.id,
-            _files_array=[],
-        )
-        self.compare_report_details = ReportDetails.objects.create(
-            report_id=self.compare_commit_report.id,
-            _files_array=[],
-        )
         self.commit_comparison = CommitComparisonFactory(
             base_commit=self.base_commit,
             compare_commit=self.compare_commit,
@@ -1883,30 +1843,6 @@ class CommitComparisonTests(TestCase):
 
         self.compare_commit.updatestamp = datetime(2023, 1, 2)
         self.compare_commit.save()
-
-        commit_comparison = CommitComparison.objects.get(pk=self.commit_comparison.pk)
-        service = CommitComparisonService(commit_comparison)
-
-        assert service.needs_recompute() == True
-
-    def test_stale_base_report_details(self):
-        # base report details were updated after comparison was made
-        self.commit_comparison.updated_at = datetime(2021, 1, 1, tzinfo=pytz.utc)
-        self.commit_comparison.save()
-        self.base_report_details.updated_at = datetime(2023, 1, 2, tzinfo=pytz.utc)
-        self.base_report_details.save()
-
-        commit_comparison = CommitComparison.objects.get(pk=self.commit_comparison.pk)
-        service = CommitComparisonService(commit_comparison)
-
-        assert service.needs_recompute() == True
-
-    def test_stale_compare_report_details(self):
-        # compare report details were updated after comparison was made
-        self.commit_comparison.updated_at = datetime(2021, 1, 1, tzinfo=pytz.utc)
-        self.commit_comparison.save()
-        self.compare_report_details.updated_at = datetime(2023, 1, 2, tzinfo=pytz.utc)
-        self.compare_report_details.save()
 
         commit_comparison = CommitComparison.objects.get(pk=self.commit_comparison.pk)
         service = CommitComparisonService(commit_comparison)

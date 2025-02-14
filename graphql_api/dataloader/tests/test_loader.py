@@ -1,7 +1,7 @@
 import pytest
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import CommitFactory
 
-from core.tests.factories import CommitFactory
 from graphql_api.dataloader.loader import BaseLoader
 
 
@@ -19,7 +19,7 @@ class BaseLoaderTestCase(TransactionTestCase):
 
     async def test_unimplemented_load(self):
         loader = BaseLoader.loader(self.info)
-        with pytest.raises(NotImplementedError) as err_info:
+        with pytest.raises(NotImplementedError):
             await loader.load(self.record.id)
 
     async def test_default_key(self):

@@ -46,7 +46,7 @@
             "object": "line_item",
             "amount": 120,
             "currency": "usd",
-            "description": "(10) users-inappm",
+            "description": "(10) users-pr-inappm",
             "discountable": true,
             "livemode": false,
             "metadata": {},
@@ -56,7 +56,7 @@
             },
             "plan": {
               "id": "ivory-freelance-040",
-              "name": "users-inappm",
+              "name": "users-pr-inappm",
               "object": "plan",
               "active": true,
               "aggregate_usage": null,
@@ -97,7 +97,10 @@
       "next_payment_attempt": null,
       "number": "EF0A41E-0001",
       "paid": true,
-      "payment_intent": null,
+      "payment_intent": {
+        "id": "pi_3P4567890123456789012345",
+        "status": "completed"
+      },
       "period_end": 1489789420,
       "period_start": 1487370220,
       "post_payment_credit_notes_amount": 0,
@@ -120,7 +123,7 @@
       "total_tax_amounts": [],
       "webhooks_delivered_at": 1489789437
     },
-      {
+    {
       "id": "in_19yTU92eZvKYlo2C7uDjvu69",
       "object": "invoice",
       "account_country": "US",
@@ -163,7 +166,7 @@
             "object": "line_item",
             "amount": 120,
             "currency": "usd",
-            "description": "(10) users-inappm",
+            "description": "(10) users-pr-inappm",
             "discountable": true,
             "livemode": false,
             "metadata": {},
@@ -173,7 +176,7 @@
             },
             "plan": {
               "id": "ivory-freelance-040",
-              "name": "users-inappm",
+              "name": "users-pr-inappm",
               "object": "plan",
               "active": true,
               "aggregate_usage": null,
@@ -214,7 +217,10 @@
       "next_payment_attempt": null,
       "number": "EF0A41E-0001",
       "paid": true,
-      "payment_intent": null,
+      "payment_intent": {
+        "id": "pi_3P4567890123456789012345",
+        "status": "completed"
+      },
       "period_end": 1489789420,
       "period_start": 1487370220,
       "post_payment_credit_notes_amount": 0,
@@ -351,7 +357,10 @@
       "on_behalf_of": null,
       "paid": false,
       "paid_out_of_band": false,
-      "payment_intent": null,
+      "payment_intent": {
+        "id": "pi_3P4567890123456789012345",
+        "status": "completed"
+      },
       "payment_settings": {
         "default_mandate": null,
         "payment_method_options": null,

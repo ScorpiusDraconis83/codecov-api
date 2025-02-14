@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+gha-creds-*.json
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -48,6 +49,8 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+*.coverage.xml
+*junit.xml
 
 # Translations
 *.mo
@@ -89,6 +92,7 @@ celerybeat-schedule
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
@@ -124,3 +128,9 @@ dmypy.json
 *.swp
 *.swo
 .vscode/
+
+# PyCharm stuff
+.idea
+.run
+
+*.pem

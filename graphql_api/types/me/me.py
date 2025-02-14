@@ -1,9 +1,11 @@
 from typing import Optional
 
-from ariadne import ObjectType, convert_kwargs_to_snake_case
+from ariadne import ObjectType
+from graphql import GraphQLResolveInfo
 
 from codecov.db import sync_to_async
-from codecov_auth.models import Owner, OwnerProfile, User
+from codecov_auth.models import Owner, OwnerProfile
+from codecov_auth.views.okta_cloud import OKTA_SIGNED_IN_ACCOUNTS_SESSION_KEY
 from graphql_api.actions.owner import (
     get_owner_login_sessions,
     get_user_tokens,
@@ -39,16 +41,25 @@ def resolve_owner(user, _):
 
 
 @me_bindable.field("viewableRepositories")
-@convert_kwargs_to_snake_case
 def resolve_viewable_repositories(
     current_user,
-    _,
+    info: GraphQLResolveInfo,
     filters=None,
     ordering=RepositoryOrdering.ID,
     ordering_direction=OrderingDirection.ASC,
     **kwargs,
 ):
-    queryset = search_repos(current_user, filters)
+    okta_authenticated_accounts: list[int] = info.context["request"].session.get(
+        OKTA_SIGNED_IN_ACCOUNTS_SESSION_KEY, []
+    )
+    is_impersonation = info.context["request"].impersonation
+    # If the user is impersonating another user, we want to show all the Okta repos.
+    # This means we do not want to filter out the Okta enforced repos
+    exclude_okta_enforced_repos = not is_impersonation
+
+    queryset = search_repos(
+        current_user, filters, okta_authenticated_accounts, exclude_okta_enforced_repos
+    )
     return queryset_to_connection(
         queryset,
         ordering=(ordering, RepositoryOrdering.ID),
@@ -116,7 +127,7 @@ def resolve_business_email(current_owner: Owner, _, **kwargs) -> Optional[str]:
 
 @me_bindable.field("privateAccess")
 @sync_to_async
-def resolve_profile(owner: Owner, info) -> bool:
+def resolve_private_access(owner: Owner, info) -> bool:
     if owner.private_access is None:
         return False
     return owner.private_access

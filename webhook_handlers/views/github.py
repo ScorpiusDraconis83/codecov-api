@@ -3,18 +3,24 @@ import logging
 import re
 from contextlib import suppress
 from hashlib import sha1, sha256
+from typing import Optional
 
+from django.db.models import Q
+from django.utils import timezone
 from django.utils.crypto import constant_time_compare
 from rest_framework import status
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from shared.metrics import metrics
+from shared.events.amplitude import AmplitudeEventPublisher
 
-from codecov_auth.models import Owner
+from codecov_auth.models import (
+    GITHUB_APP_INSTALLATION_DEFAULT_NAME,
+    GithubAppInstallation,
+    Owner,
+)
 from core.models import Branch, Commit, Pull, Repository
-from services.archive import ArchiveService
 from services.billing import BillingService
 from services.redis_configuration import get_redis_connection
 from services.task import TaskService
@@ -25,27 +31,13 @@ from webhook_handlers.constants import (
     WebhookHandlerErrorMessages,
 )
 
+from . import WEBHOOKS_ERRORED, WEBHOOKS_RECEIVED
+
 log = logging.getLogger(__name__)
 
 
 # This should probably go somewhere where it can be easily shared
 regexp_ci_skip = re.compile(r"\[(ci|skip| |-){3,}\]").search
-
-
-def _incr(name: str):
-    """
-    Increment a statsd counter. The passed-in counter will be prefixed with
-    "webhooks.github."
-    """
-    metrics.incr("webhooks.github." + name)
-
-
-def _incr_event(name: str):
-    """
-    Increment a statsd counter. The passed in counter will be prefixed with
-    "webhooks.github.received."
-    """
-    _incr("received." + name)
 
 
 class GithubWebhookHandler(APIView):
@@ -60,13 +52,28 @@ class GithubWebhookHandler(APIView):
 
     service_name = "github"
 
+    def _inc_recv(self):
+        action = self.request.data.get("action", "")
+        WEBHOOKS_RECEIVED.labels(
+            service=self.service_name, event=self.event, action=action
+        ).inc()
+
+    def _inc_err(self, reason: str):
+        action = self.request.data.get("action", "")
+        WEBHOOKS_ERRORED.labels(
+            service=self.service_name,
+            event=self.event,
+            action=action,
+            error_reason=reason,
+        ).inc()
+
     def validate_signature(self, request):
         key = get_config(
             self.service_name,
             "webhook_secret",
             default=b"testixik8qdauiab1yiffydimvi72ekq",
         )
-        if type(key) is str:
+        if isinstance(key, str):
             # If "key" comes from k8s secret, it is of type str, so
             # must convert to bytearray for use with hmac
             key = bytes(key, "utf-8")
@@ -90,11 +97,10 @@ class GithubWebhookHandler(APIView):
             or len(computed_sig) != len(expected_sig)
             or not constant_time_compare(computed_sig, expected_sig)
         ):
-            _incr("invalid_signature")
+            self._inc_err("validation_failed")
             raise PermissionDenied()
 
     def unhandled_webhook_event(self, request, *args, **kwargs):
-        _incr_event("unhandled")
         return Response(data=WebhookHandlerErrorMessages.UNSUPPORTED_EVENT)
 
     def _get_repo(self, request):
@@ -127,9 +133,10 @@ class GithubWebhookHandler(APIView):
                 )
             except Repository.DoesNotExist:
                 log.info(
-                    f"Received event for non-existent repository",
+                    "Received event for non-existent repository",
                     extra=dict(repo_service_id=repo_service_id, repo_slug=repo_slug),
                 )
+                self._inc_err("repo_not_found")
                 raise NotFound("Repository does not exist")
         else:
             try:
@@ -141,7 +148,10 @@ class GithubWebhookHandler(APIView):
                     author__ownerid=owner.ownerid, service_id=repo_service_id
                 )
             except Repository.DoesNotExist:
-                if owner.integration_id:
+                default_ghapp_installation = owner.github_app_installations.filter(
+                    name=GITHUB_APP_INSTALLATION_DEFAULT_NAME
+                ).first()
+                if default_ghapp_installation or owner.integration_id:
                     log.info(
                         "Repository no found but owner is using integration, creating repository"
                     )
@@ -149,18 +159,17 @@ class GithubWebhookHandler(APIView):
                         repo_data, owner
                     )[0]
                 log.info(
-                    f"Received event for non-existent repository",
+                    "Received event for non-existent repository",
                     extra=dict(repo_service_id=repo_service_id, repo_slug=repo_slug),
                 )
+                self._inc_err("repo_not_found")
                 raise NotFound("Repository does not exist")
 
     def ping(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.PING)
         return Response(data="pong")
 
     def repository(self, request, *args, **kwargs):
         action, repo = self.request.data.get("action"), self._get_repo(request)
-        _incr_event(GitHubWebhookEvents.REPOSITORY + "." + action)
         if action == "publicized":
             repo.private, repo.activated = False, False
             repo.save()
@@ -193,15 +202,14 @@ class GithubWebhookHandler(APIView):
         return Response()
 
     def delete(self, request, *args, **kwargs):
-        ref_type = request.data.get("ref_type")
-        _incr_event(GitHubWebhookEvents.DELETE + "." + ref_type)
+        ref_type = request.data.get("ref_type", "")
         repo = self._get_repo(request)
         if ref_type != "branch":
             log.info(
                 f"Unsupported ref type: {ref_type}, exiting",
                 extra=dict(repoid=repo.repoid, github_webhook_event=self.event),
             )
-            return Response(f"Unsupported ref type")
+            return Response("Unsupported ref type")
         branch_name = self.request.data.get("ref")[11:]
         Branch.objects.filter(
             repository=self._get_repo(request), name=branch_name
@@ -213,7 +221,6 @@ class GithubWebhookHandler(APIView):
         return Response()
 
     def public(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.PUBLIC)
         repo = self._get_repo(request)
         repo.private, repo.activated = False, False
         repo.save()
@@ -224,15 +231,14 @@ class GithubWebhookHandler(APIView):
         return Response()
 
     def push(self, request, *args, **kwargs):
-        ref_type = "branch" if request.data.get("ref")[5:10] == "heads" else "tag"
-        _incr_event(GitHubWebhookEvents.PUSH + "." + ref_type)
+        ref_type = "branch" if request.data.get("ref", "")[5:10] == "heads" else "tag"
         repo = self._get_repo(request)
         if ref_type != "branch":
             log.debug(
                 "Ref is tag, not branch, ignoring push event",
                 extra=dict(repoid=repo.repoid, github_webhook_event=self.event),
             )
-            return Response(f"Unsupported ref type")
+            return Response("Unsupported ref type")
 
         if not repo.active:
             log.debug(
@@ -241,41 +247,46 @@ class GithubWebhookHandler(APIView):
             )
             return Response(data=WebhookHandlerErrorMessages.SKIP_NOT_ACTIVE)
 
-        branch_name = self.request.data.get("ref")[11:]
+        push_webhook_ignore_repos = get_config(
+            "setup", "push_webhook_ignore_repo_names", default=[]
+        )
+        if repo.name in push_webhook_ignore_repos:
+            log.debug(
+                "Codecov is configured to ignore this repository name",
+                extra=dict(
+                    repoid=repo.repoid,
+                    github_webhook_event=self.event,
+                    repo_name=repo.name,
+                ),
+            )
+            return Response(data=WebhookHandlerErrorMessages.SKIP_WEBHOOK_IGNORED)
+
+        pushed_to_branch_name = self.request.data.get("ref")[11:]
         commits = self.request.data.get("commits", [])
 
         if not commits:
             log.debug(
-                f"No commits in webhook payload for branch {branch_name}",
+                f"No commits in webhook payload for branch {pushed_to_branch_name}",
                 extra=dict(repoid=repo.repoid, github_webhook_event=self.event),
             )
             return Response()
 
-        commits_queryset = Commit.objects.filter(
-            repository=repo,
-            commitid__in=[commit.get("id") for commit in commits],
-            merged=False,
-        )
-        commits_queryset.update(branch=branch_name)
-        if branch_name == repo.branch:
-            commits_queryset.update(merged=True)
+        if pushed_to_branch_name == repo.branch:
+            commits_queryset = Commit.objects.filter(
+                ~Q(branch=pushed_to_branch_name),
+                repository=repo,
+                commitid__in=[commit.get("id") for commit in commits],
+                merged=False,
+            )
+            commits_queryset.update(branch=pushed_to_branch_name, merged=True)
             log.info(
-                "Pushed commits to default branch; setting merged to True",
+                f"Branch name updated for commits to {pushed_to_branch_name}; setting merged to True",
                 extra=dict(
                     repoid=repo.repoid,
                     github_webhook_event=self.event,
                     commits=[commit.get("id") for commit in commits],
                 ),
             )
-
-        log.info(
-            f"Branch name updated for commits to {branch_name}",
-            extra=dict(
-                repoid=repo.repoid,
-                github_webhook_event=self.event,
-                commits=[commit.get("id") for commit in commits],
-            ),
-        )
 
         most_recent_commit = commits[-1]
 
@@ -302,14 +313,13 @@ class GithubWebhookHandler(APIView):
             TaskService().status_set_pending(
                 repoid=repo.repoid,
                 commitid=most_recent_commit.get("id"),
-                branch=branch_name,
+                branch=pushed_to_branch_name,
                 on_a_pull_request=False,
             )
 
         return Response()
 
     def status(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.STATUS)
         repo = self._get_repo(request)
         commitid = request.data.get("sha")
 
@@ -355,7 +365,6 @@ class GithubWebhookHandler(APIView):
         return Response()
 
     def pull_request(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.PULL_REQUEST)
         repo = self._get_repo(request)
 
         if not repo.active:
@@ -389,32 +398,187 @@ class GithubWebhookHandler(APIView):
 
         return Response()
 
-    def _handle_installation_events(self, request, *args, **kwargs):
+    def _decide_app_name(self, ghapp: GithubAppInstallation) -> str:
+        """Possibly updated the name of a GithubAppInstallation that has been fetched from DB or created.
+        Only the real default installation maybe use the name `GITHUB_APP_INSTALLATION_DEFAULT_NAME`
+        (otherwise we break the app)
+        We check that apps:
+            * already were given a custom name (do nothing);
+            * app_id match the configured default app app_id (use default name);
+            * none of the above (use 'unconfigured_app');
+
+        Returns the app name that should be used
+        """
+        if ghapp.is_configured():
+            return ghapp.name
+        log.warning(
+            "Github installation is unconfigured. Changing name to 'unconfigured_app'",
+            extra=dict(installation=ghapp.external_id, previous_name=ghapp.name),
+        )
+        return "unconfigured_app"
+
+    def _handle_installation_repository_events(self, request, *args, **kwargs):
+        # https://docs.github.com/en/webhooks/webhook-events-and-payloads#installation_repositories
+        service_id = request.data["installation"]["account"]["id"]
+        username = request.data["installation"]["account"]["login"]
+        owner, _ = Owner.objects.get_or_create(
+            service=self.service_name,
+            service_id=service_id,
+            defaults={
+                "username": username,
+                "createstamp": timezone.now(),
+            },
+        )
+
+        installation_id = request.data["installation"]["id"]
+
+        ghapp_installation, _ = GithubAppInstallation.objects.get_or_create(
+            installation_id=installation_id, owner=owner
+        )
+        app_id = request.data["installation"]["app_id"]
+        # Either update or set
+        # But this value shouldn't change for the installation, so doesn't matter
+        ghapp_installation.app_id = app_id
+        ghapp_installation.name = self._decide_app_name(ghapp_installation)
+
+        all_repos_affected = request.data.get("repository_selection") == "all"
+        if all_repos_affected:
+            ghapp_installation.repository_service_ids = None
+        else:
+            repo_list_to_save = set(ghapp_installation.repository_service_ids or [])
+            repositories_added_service_ids = {
+                obj["id"] for obj in request.data.get("repositories_added", [])
+            }
+            repositories_removed_service_ids = {
+                obj["id"] for obj in request.data.get("repositories_removed", [])
+            }
+            repo_list_to_save = repo_list_to_save.union(
+                repositories_added_service_ids
+            ).difference(repositories_removed_service_ids)
+            ghapp_installation.repository_service_ids = list(repo_list_to_save)
+        ghapp_installation.save()
+
+    def _handle_installation_events(
+        self, request, *args, event=GitHubWebhookEvents.INSTALLATION, **kwargs
+    ):
         service_id = request.data["installation"]["account"]["id"]
         username = request.data["installation"]["account"]["login"]
         action = request.data.get("action")
 
         owner, _ = Owner.objects.get_or_create(
-            service=self.service_name, service_id=service_id, username=username
+            service=self.service_name,
+            service_id=service_id,
+            defaults={
+                "username": username,
+                "createstamp": timezone.now(),
+            },
         )
 
+        installation_id = request.data["installation"]["id"]
+
+        # https://docs.github.com/en/webhooks/webhook-events-and-payloads#installation
         if action == "deleted":
+            if event == GitHubWebhookEvents.INSTALLATION:
+                ghapp_installation: Optional[GithubAppInstallation] = (
+                    owner.github_app_installations.filter(
+                        installation_id=installation_id
+                    ).first()
+                )
+                if ghapp_installation is not None:
+                    ghapp_installation.delete()
+            # Deprecated flow - BEGIN
             owner.integration_id = None
             owner.save()
             owner.repository_set.all().update(using_integration=False, bot=None)
+            # Deprecated flow - END
             log.info(
                 "Owner deleted app integration",
                 extra=dict(ownerid=owner.ownerid, github_webhook_event=self.event),
             )
         else:
+            # GithubWebhookEvents.INSTALLTION_REPOSITORIES also execute this code
+            # because of deprecated flow. But the GithubAppInstallation shouldn't be changed
+            if event == GitHubWebhookEvents.INSTALLATION:
+                ghapp_installation, was_created = (
+                    GithubAppInstallation.objects.get_or_create(
+                        installation_id=installation_id, owner=owner
+                    )
+                )
+                if was_created:
+                    installer_username = request.data.get("sender", {}).get(
+                        "login", None
+                    )
+                    installer = (
+                        Owner.objects.filter(
+                            service=self.service_name,
+                            username=installer_username,
+                        ).first()
+                        if installer_username
+                        else None
+                    )
+                    # If installer does not exist, just attribute the action to the org owner.
+                    AmplitudeEventPublisher().publish(
+                        "App Installed",
+                        {
+                            "user_ownerid": installer.ownerid
+                            if installer is not None
+                            else owner.ownerid,
+                            "ownerid": owner.ownerid,
+                        },
+                    )
+
+                app_id = request.data["installation"]["app_id"]
+                # Either update or set
+                # But this value shouldn't change for the installation, so doesn't matter
+                ghapp_installation.app_id = app_id
+                ghapp_installation.name = self._decide_app_name(ghapp_installation)
+
+                affects_all_repositories = (
+                    request.data["installation"]["repository_selection"] == "all"
+                )
+                if affects_all_repositories:
+                    ghapp_installation.repository_service_ids = None
+                else:
+                    repositories_service_ids = [
+                        obj["id"] for obj in request.data.get("repositories", [])
+                    ]
+                    ghapp_installation.repository_service_ids = repositories_service_ids
+
+                if action in ["suspend", "unsuspend"]:
+                    log.info(
+                        "Request to suspend/unsuspend App",
+                        extra=dict(
+                            action=action,
+                            is_currently_suspended=ghapp_installation.is_suspended,
+                            ownerid=owner.ownerid,
+                            installation_id=request.data["installation"]["id"],
+                        ),
+                    )
+                    ghapp_installation.is_suspended = action == "suspend"
+
+                ghapp_installation.save()
+
+            # This flow is deprecated and should be removed once the
+            # work on github app integration model is complete and backfilled
+            # Deprecated flow - BEGIN
             if owner.integration_id is None:
                 owner.integration_id = request.data["installation"]["id"]
                 owner.save()
+            # Deprecated flow - END
 
             log.info(
                 "Triggering refresh task to sync repos",
                 extra=dict(ownerid=owner.ownerid, github_webhook_event=self.event),
             )
+
+            repos_affected = (
+                request.data.get("repositories", [])
+                + request.data.get("repositories_added", [])
+                + request.data.get("repositories_removed", [])
+            )
+            repos_affected_clean = {
+                (obj["id"], obj["node_id"]) for obj in repos_affected
+            }
 
             TaskService().refresh(
                 ownerid=owner.ownerid,
@@ -422,21 +586,29 @@ class GithubWebhookHandler(APIView):
                 sync_teams=False,
                 sync_repos=True,
                 using_integration=True,
+                repos_affected=list(repos_affected_clean),
             )
 
         return Response(data="Integration webhook received")
 
     def installation(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.INSTALLATION)
-        return self._handle_installation_events(request, *args, **kwargs)
+        return self._handle_installation_events(
+            request, *args, **kwargs, event=GitHubWebhookEvents.INSTALLATION
+        )
 
     def installation_repositories(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.INSTALLATION_REPOSITORIES)
-        return self._handle_installation_events(request, *args, **kwargs)
+        self._handle_installation_repository_events(request, *args, **kwargs)
+        # This is kept to preserve the logic for deprecated usage of owner.installation_id
+        # It can be removed once the move to codecov_auth.GithubAppInstallation is complete
+        return self._handle_installation_events(
+            request,
+            *args,
+            **kwargs,
+            event=GitHubWebhookEvents.INSTALLATION_REPOSITORIES,
+        )
 
     def organization(self, request, *args, **kwargs):
         action = request.data.get("action")
-        _incr_event(GitHubWebhookEvents.ORGANIZATION + "." + action)
         if action == "member_removed":
             log.info(
                 f"Removing user with service-id {request.data['membership']['user']['id']} "
@@ -472,12 +644,15 @@ class GithubWebhookHandler(APIView):
                     data="Attempted to remove non Codecov user from Codecov org failed",
                 )
 
-            try:
-                if member.organizations:
-                    member.organizations.remove(org.ownerid)
-                    member.save(update_fields=["organizations"])
-            except ValueError:
-                pass
+            # Force a sync for the removed member to remove their access to the
+            # org and its private repositories.
+            TaskService().refresh(
+                ownerid=member.ownerid,
+                username=member.username,
+                sync_teams=True,
+                sync_repos=True,
+                using_integration=False,
+            )
 
             try:
                 if org.plan_activated_users:
@@ -523,16 +698,14 @@ class GithubWebhookHandler(APIView):
         return Response()
 
     def marketplace_purchase(self, request, *args, **kwargs):
-        _incr_event(GitHubWebhookEvents.MARKETPLACE_PURCHASE)
         return self._handle_marketplace_events(request, *args, **kwargs)
 
     def member(self, request, *args, **kwargs):
         action = request.data["action"]
-        _incr_event(GitHubWebhookEvents.MEMBER + "." + action)
         if action == "removed":
             repo = self._get_repo(request)
             log.info(
-                f"Request to remove read permissions for user",
+                "Request to remove read permissions for user",
                 extra=dict(repoid=repo.repoid, github_webhook_event=self.event),
             )
             try:
@@ -541,7 +714,7 @@ class GithubWebhookHandler(APIView):
                 )
             except Owner.DoesNotExist:
                 log.info(
-                    f"Repository permissions unchanged -- owner doesn't exist",
+                    "Repository permissions unchanged -- owner doesn't exist",
                     extra=dict(repoid=repo.repoid, github_webhook_event=self.event),
                 )
                 return Response(status=status.HTTP_404_NOT_FOUND)
@@ -559,7 +732,7 @@ class GithubWebhookHandler(APIView):
                 )
             except (ValueError, AttributeError):
                 log.info(
-                    f"Member didn't have read permissions, didn't update",
+                    "Member didn't have read permissions, didn't update",
                     extra=dict(
                         repoid=repo.repoid,
                         ownerid=member.ownerid,
@@ -571,7 +744,7 @@ class GithubWebhookHandler(APIView):
 
     def post(self, request, *args, **kwargs):
         self.event = self.request.META.get(GitHubHTTPHeaders.EVENT)
-        log.debug(
+        log.info(
             "GitHub Webhook Handler invoked",
             extra=dict(
                 github_webhook_event=self.event,
@@ -581,9 +754,12 @@ class GithubWebhookHandler(APIView):
 
         self.validate_signature(request)
 
-        _incr_event("total")
-        handler = getattr(self, self.event, self.unhandled_webhook_event)
-        return handler(request, *args, **kwargs)
+        if handler := getattr(self, self.event, None):
+            self._inc_recv()
+            return handler(request, *args, **kwargs)
+        else:
+            self._inc_err("unhandled_event")
+            return self.unhandled_webhook_event(request, *args, **kwargs)
 
 
 class GithubEnterpriseWebhookHandler(GithubWebhookHandler):

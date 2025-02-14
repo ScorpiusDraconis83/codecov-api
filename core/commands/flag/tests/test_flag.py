@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
-from django.contrib.auth.models import AnonymousUser
 from django.test import TransactionTestCase, override_settings
+from shared.django_apps.core.tests.factories import OwnerFactory, RepositoryFactory
 
 from codecov.commands.exceptions import (
     NotFound,
@@ -9,8 +9,6 @@ from codecov.commands.exceptions import (
     Unauthorized,
     ValidationError,
 )
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import RepositoryFactory
 from reports.tests.factories import RepositoryFlagFactory
 
 from ..flag import FlagCommands
@@ -20,6 +18,7 @@ class FlagCommandsTest(TransactionTestCase):
     def setUp(self):
         self.owner = OwnerFactory(username="test-user")
         self.org = OwnerFactory(username="test-org", admins=[self.owner.pk])
+        self.owner.organizations = [self.org.pk]
         self.repo = RepositoryFactory(author=self.org)
         self.command = FlagCommands(self.owner, "github")
         self.flag = RepositoryFlagFactory(repository=self.repo, flag_name="test-flag")

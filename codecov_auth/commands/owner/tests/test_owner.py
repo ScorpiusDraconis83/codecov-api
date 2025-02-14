@@ -1,8 +1,7 @@
 from unittest.mock import patch
 
 from django.test import TransactionTestCase
-
-from codecov_auth.tests.factories import OwnerFactory
+from shared.django_apps.core.tests.factories import OwnerFactory
 
 from ..owner import OwnerCommands
 
@@ -56,7 +55,7 @@ class OwnerCommandsTest(TransactionTestCase):
         interactor_mock.assert_called_once_with(input_dict)
 
     @patch("codecov_auth.commands.owner.owner.StartTrialInteractor.execute")
-    def test_cancel_trial_delegate_to_interactor(self, interactor_mock):
+    def test_start_trial_delegate_to_interactor(self, interactor_mock):
         org_username = "random_org"
         self.command.start_trial(org_username=org_username)
         interactor_mock.assert_called_once_with(org_username=org_username)
@@ -121,3 +120,25 @@ class OwnerCommandsTest(TransactionTestCase):
         owner = {}
         self.command.regenerate_org_upload_token(owner)
         interactor_mock.assert_called_once_with(owner)
+
+    @patch("codecov_auth.commands.owner.owner.SaveOktaConfigInteractor.execute")
+    def test_save_okta_config_delegate_to_interactor(self, interactor_mock):
+        input_dict = {
+            "client_id": "123",
+            "client_secret": "123",
+            "url": "http://example.com",
+            "enabled": True,
+            "enforced": False,
+            "org_username": "codecov-user",
+        }
+        self.command.save_okta_config(input_dict)
+        interactor_mock.assert_called_once_with(input_dict)
+
+    @patch("codecov_auth.commands.owner.owner.SetUploadTokenRequiredInteractor.execute")
+    def test_set_upload_token_required_delegate_to_interactor(self, interactor_mock):
+        input_dict = {
+            "upload_token_required": True,
+            "org_username": "codecov-user",
+        }
+        self.command.set_upload_token_required(input_dict)
+        interactor_mock.assert_called_once_with(input_dict)

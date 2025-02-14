@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Any, Dict
 
 import requests
 from requests.exceptions import ConnectionError, HTTPError
@@ -11,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
-    def get_build(self):
+    def get_build(self) -> Dict[str, Any]:
         query = f"""{{
             "query": "query ($buildId: ID!) {{
                 build(id: $buildId) {{
@@ -26,7 +27,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
                 }}
             }}",
             "variables": {{
-                "buildId": {self.upload_params.get('build')}
+                "buildId": {self.upload_params.get("build")}
             }}
         }}"""
 
@@ -74,7 +75,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
 
         return build
 
-    def verify(self):
+    def verify(self) -> str:
         if not self.upload_params.get("owner"):
             raise NotFound(
                 'Missing "owner" argument. Please upload with the Codecov repository upload token to resolve this issue.'
@@ -99,7 +100,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
         # Check repository
         if build["repository"]["owner"] != owner or build["repository"]["name"] != repo:
             log.warning(
-                f"Repository slug does not match Cirrus arguments",
+                "Repository slug does not match Cirrus arguments",
                 extra=dict(
                     build_info=build,
                     commit=commit,
@@ -115,7 +116,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
         # Check commit SHA
         if build["changeIdInRepo"] != commit:
             log.warning(
-                f"Commit sha does not match Github actions arguments",
+                "Commit sha does not match Github actions arguments",
                 extra=dict(
                     build_info=build,
                     commit=commit,
@@ -138,7 +139,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
             now = time.time()
             if now > finishTimestamp:
                 log.warning(
-                    f"Cirrus run is stale",
+                    "Cirrus run is stale",
                     extra=dict(
                         build_info=build,
                         commit=commit,
@@ -148,7 +149,7 @@ class TokenlessCirrusHandler(BaseTokenlessUploadHandler):
                     ),
                 )
                 log.warning(
-                    f"Cirrus run is stale",
+                    "Cirrus run is stale",
                     extra=dict(
                         build_info=build,
                         commit=commit,

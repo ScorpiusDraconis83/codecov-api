@@ -2,18 +2,27 @@ from unittest.mock import MagicMock, Mock
 
 from django.test import override_settings
 from rest_framework.test import APITestCase
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
+from shared.django_apps.reports.models import ReportType
+from shared.plan.constants import DEFAULT_FREE_PLAN
+from shared.upload.utils import UploaderType, insert_coverage_measurement
 
-from core.tests.factories import CommitFactory, OwnerFactory, RepositoryFactory
-from plan.constants import PlanName
+from billing.helpers import mock_all_plans_and_tiers
 from reports.tests.factories import CommitReportFactory, UploadFactory
+from services.redis_configuration import get_redis_connection
 from upload.throttles import UploadsPerCommitThrottle, UploadsPerWindowThrottle
 
 
 class ThrottlesUnitTests(APITestCase):
-    def setUp(self):
-        self.owner = OwnerFactory(
-            plan=PlanName.BASIC_PLAN_NAME.value, max_upload_limit=150
-        )
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        mock_all_plans_and_tiers()
+        cls.owner = OwnerFactory(plan=DEFAULT_FREE_PLAN, max_upload_limit=150)
 
     def request_should_not_throttle(self, commit):
         self.uploads_per_window_not_throttled(commit)
@@ -48,7 +57,7 @@ class ThrottlesUnitTests(APITestCase):
     @override_settings(UPLOAD_THROTTLING_ENABLED=False)
     def test_check_commit_constraints_settings_disabled(self):
         repository = RepositoryFactory(
-            author__plan=PlanName.BASIC_PLAN_NAME.value,
+            author__plan=DEFAULT_FREE_PLAN,
             private=True,
             author=self.owner,
         )
@@ -57,12 +66,34 @@ class ThrottlesUnitTests(APITestCase):
         third_commit = CommitFactory(repository__author=repository.author)
         unrelated_commit = CommitFactory()
 
-        first_report = CommitReportFactory(commit=first_commit)
-        sec_report = CommitReportFactory(commit=second_commit)
+        first_report = CommitReportFactory(
+            commit=first_commit, report_type=ReportType.COVERAGE.value
+        )
+        sec_report = CommitReportFactory(
+            commit=second_commit, report_type=ReportType.COVERAGE.value
+        )
 
         for i in range(150):
-            UploadFactory(report=first_report)
-            UploadFactory(report=sec_report)
+            first_upload = UploadFactory(report=first_report)
+            insert_coverage_measurement(
+                owner_id=self.owner.ownerid,
+                repo_id=repository.repoid,
+                commit_id=first_commit.id,
+                upload_id=first_upload.id,
+                uploader_used=UploaderType.CLI.value,
+                private_repo=repository.private,
+                report_type=first_report.report_type,
+            )
+            second_upload = UploadFactory(report=sec_report)
+            insert_coverage_measurement(
+                owner_id=self.owner.ownerid,
+                repo_id=repository.repoid,
+                commit_id=second_commit.id,
+                upload_id=second_upload.id,
+                uploader_used=UploaderType.CLI.value,
+                private_repo=repository.private,
+                report_type=sec_report.report_type,
+            )
 
         # no commit should be throttled
         self.request_should_not_throttle(first_commit)
@@ -71,7 +102,7 @@ class ThrottlesUnitTests(APITestCase):
         self.request_should_not_throttle(unrelated_commit)
 
     @override_settings(UPLOAD_THROTTLING_ENABLED=True)
-    def test_check_commit_constraints_settings_enabled(self):
+    def test_throttle_check_commit_constraints_settings_enabled(self):
         author = self.owner
         first_commit = CommitFactory.create(repository__author=author)
 
@@ -85,18 +116,49 @@ class ThrottlesUnitTests(APITestCase):
 
         unrelated_commit = CommitFactory.create()
 
-        second_report = CommitReportFactory.create(commit=second_commit)
-        fourth_report = CommitReportFactory.create(commit=fourth_commit)
+        second_report = CommitReportFactory.create(
+            commit=second_commit, report_type=ReportType.COVERAGE.value
+        )
+        fourth_report = CommitReportFactory.create(
+            commit=fourth_commit, report_type=ReportType.COVERAGE.value
+        )
         self.request_should_not_throttle(third_commit)
 
         for i in range(300):
-            UploadFactory.create(report__commit__repository=public_repository)
+            upload = UploadFactory.create(report__commit__repository=public_repository)
+            insert_coverage_measurement(
+                owner_id=author.ownerid,
+                repo_id=public_repository.repoid,
+                commit_id=second_commit.id,
+                upload_id=upload.id,
+                uploader_used=UploaderType.CLI.value,
+                private_repo=public_repository.private,
+                report_type=second_report.report_type,
+            )
         # ensuring public repos counts don't count towards the quota
         self.request_should_not_throttle(third_commit)
 
         for i in range(150):
-            UploadFactory.create(report=second_report)
-            UploadFactory.create(report=fourth_report)
+            second_upload = UploadFactory.create(report=second_report)
+            insert_coverage_measurement(
+                owner_id=author.ownerid,
+                repo_id=repository.repoid,
+                commit_id=second_commit.id,
+                upload_id=second_upload.id,
+                uploader_used=UploaderType.CLI.value,
+                private_repo=repository.private,
+                report_type=second_report.report_type,
+            )
+            fourth_upload = UploadFactory.create(report=fourth_report)
+            insert_coverage_measurement(
+                owner_id=author.ownerid,
+                repo_id=repository.repoid,
+                commit_id=fourth_commit.id,
+                upload_id=fourth_upload.id,
+                uploader_used=UploaderType.CLI.value,
+                private_repo=repository.private,
+                report_type=fourth_report.report_type,
+            )
         # second and fourth commit already has uploads made, we won't block uploads to them
         self.request_should_not_throttle(second_commit)
         self.request_should_not_throttle(fourth_commit)
@@ -127,3 +189,14 @@ class ThrottlesUnitTests(APITestCase):
                 self.uploads_per_commit_throttled(commit)
             else:
                 self.request_should_not_throttle(commit)
+
+    def test_validate_redis_counter(self):
+        redis = get_redis_connection()
+        owner = self.owner
+        cache_key = f"monthly_upload_usage_{owner.ownerid}"
+        redis.set(cache_key, 1, ex=259200)
+        repo = RepositoryFactory.create(author=owner)
+        commit = CommitFactory.create(totals={}, repository=repo)
+        self.request_should_not_throttle(commit)
+        assert redis.get(cache_key) == b"1"
+        redis.delete(cache_key)

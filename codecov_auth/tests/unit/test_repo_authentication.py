@@ -1,17 +1,26 @@
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import QuerySet
 from django.test import override_settings
 from django.utils import timezone
+from jwt import PyJWTError
 from rest_framework import exceptions
 from rest_framework.test import APIRequestFactory
-from shared.torngit.exceptions import TorngitObjectNotFoundError
+from shared.django_apps.codecov_auth.models import Owner, Service
+from shared.django_apps.core.models import Repository
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+    RepositoryTokenFactory,
+)
 
 from codecov_auth.authentication.repo_auth import (
-    TOKENLESS_AUTH_BY_OWNER_SLUG,
+    GitHubOIDCTokenAuthentication,
     GlobalTokenAuthentication,
     OrgLevelTokenAuthentication,
     RepositoryLegacyQueryTokenAuthentication,
@@ -19,10 +28,10 @@ from codecov_auth.authentication.repo_auth import (
     RepositoryTokenAuthentication,
     TokenlessAuth,
     TokenlessAuthentication,
+    UploadTokenRequiredAuthenticationCheck,
+    UploadTokenRequiredGetFromBodyAuthenticationCheck,
 )
-from codecov_auth.models import OrganizationLevelToken, RepositoryToken
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import RepositoryFactory, RepositoryTokenFactory
+from codecov_auth.models import SERVICE_GITHUB, OrganizationLevelToken, RepositoryToken
 
 
 class TestRepositoryLegacyQueryTokenAuthentication(object):
@@ -66,20 +75,20 @@ class TestRepositoryLegacyTokenAuthentication(object):
     def test_authenticate_credentials_empty(self, db):
         token = None
         authentication = RepositoryLegacyTokenAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed):
-            authentication.authenticate_credentials(token)
+        res = authentication.authenticate_credentials(token)
+        assert res is None
 
     def test_authenticate_credentials_not_uuid(self, db):
         token = "not-a-uuid"
         authentication = RepositoryLegacyTokenAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed):
-            authentication.authenticate_credentials(token)
+        res = authentication.authenticate_credentials(token)
+        assert res is None
 
     def test_authenticate_credentials_uuid_no_repo(self, db):
         token = str(uuid.uuid4())
         authentication = RepositoryLegacyTokenAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed):
-            authentication.authenticate_credentials(token)
+        res = authentication.authenticate_credentials(token)
+        assert res is None
 
     def test_authenticate_credentials_uuid_token_with_repo(self, db):
         repo = RepositoryFactory.create()
@@ -162,64 +171,165 @@ class TestGlobalTokenAuthentication(object):
             "bitbucketserveruploadtoken": "bitbucket_server",
         }
 
-    def test_authentication_for_non_enterprise(self):
+    @patch("codecov_auth.authentication.repo_auth.get_global_tokens")
+    def test_authentication_no_global_token_available(self, mocked_get_global_tokens):
+        mocked_get_global_tokens.return_value = {}
         authentication = GlobalTokenAuthentication()
-        request = APIRequestFactory().post("/endpoint")
+        request = APIRequestFactory().post("/upload/service/owner::::repo/commits")
         res = authentication.authenticate(request)
         assert res is None
 
     @patch("codecov_auth.authentication.repo_auth.get_global_tokens")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_token")
-    def test_authentication_for_enterprise_wrong_token(
-        self, mocked_token, mocked_get_global_tokens
-    ):
+    def test_authentication_for_enterprise_wrong_token(self, mocked_get_global_tokens):
         mocked_get_global_tokens.return_value = self.get_mocked_global_tokens()
-        mocked_token.return_value = "random_token"
         authentication = GlobalTokenAuthentication()
-        request = APIRequestFactory().post("/endpoint")
+        request = APIRequestFactory().post(
+            "/upload/service/owner::::repo/commits",
+            headers={"Authorization": "token GUT"},
+        )
         res = authentication.authenticate(request)
         assert res is None
 
     @patch("codecov_auth.authentication.repo_auth.get_global_tokens")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_token")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_owner")
     def test_authentication_for_enterprise_correct_token_repo_not_exists(
-        self, mocked_owner, mocked_token, mocked_get_global_tokens, db
+        self, mocked_get_global_tokens, db
     ):
         mocked_get_global_tokens.return_value = self.get_mocked_global_tokens()
-        mocked_token.return_value = "githubuploadtoken"
-        mocked_owner.return_value = OwnerFactory.create()
         authentication = GlobalTokenAuthentication()
-        request = APIRequestFactory().post("/endpoint")
+        request = APIRequestFactory().post(
+            "/upload/service/owner::::repo/commits",
+            headers={"Authorization": "token githubuploadtoken"},
+        )
         with pytest.raises(exceptions.AuthenticationFailed) as exc:
             authentication.authenticate(request)
         assert exc.value.args == (
             "Could not find a repository, try using repo upload token",
         )
 
+    @pytest.mark.parametrize(
+        "owner_service, owner_name, token",
+        [
+            pytest.param("github", "username", "githubuploadtoken", id="github"),
+            pytest.param(
+                "gitlab", "username", "gitlabuploadtoken", id="gitlab_single_user"
+            ),
+            pytest.param(
+                "gitlab",
+                "usergroup:username",
+                "gitlabuploadtoken",
+                id="gitlab_subgroup_user",
+            ),
+        ],
+    )
     @patch("codecov_auth.authentication.repo_auth.get_global_tokens")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_token")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_owner")
-    @patch("codecov_auth.authentication.repo_auth.GlobalTokenAuthentication.get_repoid")
     def test_authentication_for_enterprise_correct_token_repo_exists(
-        self, mocked_repoid, mocked_owner, mocked_token, mocked_get_global_tokens, db
+        self, mocked_get_global_tokens, owner_service, owner_name, token, db
     ):
         mocked_get_global_tokens.return_value = self.get_mocked_global_tokens()
-        mocked_token.return_value = "githubuploadtoken"
-        owner = OwnerFactory.create(service="github")
-        repoid = 123
-        mocked_repoid.return_value = repoid
-        mocked_owner.return_value = owner
-
-        repository = RepositoryFactory.create(author=owner, repoid=repoid)
+        owner = OwnerFactory.create(service=owner_service, username=owner_name)
+        owner_name.replace(":", ":::")  # encode name to test GL subgroups
+        repository = RepositoryFactory.create(author=owner)
         authentication = GlobalTokenAuthentication()
-        request = APIRequestFactory().post("/endpoint")
+        request = APIRequestFactory().post(
+            f"/upload/{owner_service}/{owner_name}::::{repository.name}/commits",
+            headers={"Authorization": f"token {token}"},
+        )
         res = authentication.authenticate(request)
         assert res is not None
         user, auth = res
         assert user._repository == repository
         assert auth.get_repositories() == [repository]
         assert auth.get_scopes() == ["upload"]
+
+
+@patch("codecov_auth.authentication.repo_auth.get_repo_with_github_actions_oidc_token")
+class TestGitHubOIDCTokenAuthentication(object):
+    def test_authenticate_credentials_empty_returns_none(
+        self, mocked_get_repo_with_token, db
+    ):
+        token = None
+        authentication = GitHubOIDCTokenAuthentication()
+        res = authentication.authenticate_credentials(token)
+        assert res is None
+
+    def test_authenticate_credentials_uuid_returns_none(
+        self, mocked_get_repo_with_token, db
+    ):
+        token = uuid.uuid4()
+        authentication = GitHubOIDCTokenAuthentication()
+        res = authentication.authenticate_credentials(token)
+        assert res is None
+
+    def test_authenticate_credentials_no_repo(self, mocked_get_repo_with_token, db):
+        mocked_get_repo_with_token.side_effect = ObjectDoesNotExist()
+        token = "the best token"
+        authentication = GitHubOIDCTokenAuthentication()
+        res = authentication.authenticate_credentials(token)
+        assert res is None
+
+    def test_authenticate_credentials_oidc_error(self, mocked_get_repo_with_token, db):
+        mocked_get_repo_with_token.side_effect = PyJWTError()
+        token = "the best token"
+        authentication = GitHubOIDCTokenAuthentication()
+        res = authentication.authenticate_credentials(token)
+        assert res is None
+
+    def test_authenticate_credentials_oidc_valid(self, mocked_get_repo_with_token, db):
+        token = "the best token"
+        repository = RepositoryFactory()
+        owner = repository.author
+        owner.service = SERVICE_GITHUB
+        owner.save()
+        mocked_get_repo_with_token.return_value = repository
+        authentication = GitHubOIDCTokenAuthentication()
+        res = authentication.authenticate_credentials(token)
+        assert res is not None
+        user, auth = res
+        assert auth.get_repositories() == [repository]
+        assert auth.allows_repo(repository)
+        assert user._repository == repository
+        assert auth.get_scopes() == ["upload"]
+
+
+valid_params_to_test = [
+    ("/upload/github/owner::::the_repo/commits", "owner/the_repo", None),
+    ("/upload/github/owner::::the_repo/commits/", "owner/the_repo", None),
+    (
+        "/upload/github/owner::::the_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports",
+        "owner/the_repo",
+        "9652fb7ff577f554588ea83afded9000acd084ee",
+    ),
+    (
+        "/upload/github/owner::::the_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/",
+        "owner/the_repo",
+        "9652fb7ff577f554588ea83afded9000acd084ee",
+    ),
+    (
+        "/upload/github/owner::::the_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/default/uploads",
+        "owner/the_repo",
+        "9652fb7ff577f554588ea83afded9000acd084ee",
+    ),
+    (
+        "/upload/github/owner::::the_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/default/uploads/",
+        "owner/the_repo",
+        "9652fb7ff577f554588ea83afded9000acd084ee",
+    ),
+    (
+        "/upload/github/owner::::example-repo/commits",
+        "owner/example-repo",
+        None,
+    ),
+    (
+        "/upload/github/owner::::__example-repo__/commits",
+        "owner/__example-repo__",
+        None,
+    ),
+    (
+        "/upload/github/owner::::~example-repo:copy/commits",
+        "owner/~example-repo:copy",
+        None,
+    ),
+]
 
 
 class TestOrgLevelTokenAuthentication(object):
@@ -235,7 +345,7 @@ class TestOrgLevelTokenAuthentication(object):
         token = uuid.uuid4()
         authentication = OrgLevelTokenAuthentication()
         res = authentication.authenticate_credentials(token)
-        assert res == None
+        assert res is None
 
     @override_settings(IS_ENTERPRISE=False)
     def test_owner_has_token_but_wrong_one_sent_return_none(self, db, mocker):
@@ -250,7 +360,7 @@ class TestOrgLevelTokenAuthentication(object):
         )
         authentication = OrgLevelTokenAuthentication()
         res = authentication.authenticate(request)
-        assert res == None
+        assert res is None
         assert OrganizationLevelToken.objects.filter(owner=owner).count() == 1
 
     @override_settings(IS_ENTERPRISE=False)
@@ -346,50 +456,27 @@ class TestOrgLevelTokenAuthentication(object):
         assert auth.allows_repo(other_repo_from_owner)
         assert not auth.allows_repo(random_repo)
 
-
-class TestTokenlessAuth(object):
-    @pytest.mark.parametrize(
-        "headers",
-        [{}, {"X-Tokenless": "user-name/repo-forked"}, {"X-Tokenless-PR": "15"}],
-    )
-    def test_tokenless_missing_headers(self, headers):
-        request = APIRequestFactory().post(
-            "/upload/unknown_provider/owner::::repo/commits/commit_sha/reports/report_code/uploads",
-            headers=headers,
-        )
-        authentication = TokenlessAuthentication()
-        res = authentication.authenticate(request)
+    def test_token_is_not_uuid(self):
+        """
+        OIDC tokens are not UUID, so if you do token = OrganizationLevelToken.objects.filter(token=key).first(),
+        you get a ValidationError for trying a non-UUID in a models.UUIDField. Rather than adding a try/except,
+        check whether the incoming `key` is a UUID - if not, don't try to find it in OrganizationLevelToken.
+        """
+        authentication = OrgLevelTokenAuthentication()
+        token = "not a uuid"
+        res = authentication.authenticate_credentials(token)
         assert res is None
 
+
+class TestTokenlessAuth(object):
     def test_tokenless_bad_path(self):
         request = APIRequestFactory().post(
             "/endpoint",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
+            headers={},
         )
         authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
-
-    def test_tokenless_unknown_service(self):
-        request = APIRequestFactory().post(
-            "/upload/unknown_provider/owner::::repo/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
-        )
-        authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
-
-    def test_tokenless_not_supported_services(self):
-        request = APIRequestFactory().post(
-            "/upload/gitlab/owner::::repo/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
-        )
-        authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
+        with pytest.raises(exceptions.AuthenticationFailed):
+            _ = authentication.authenticate(request)
 
     def test_tokenless_unknown_repository(self, db):
         request = APIRequestFactory().post(
@@ -397,178 +484,416 @@ class TestTokenlessAuth(object):
             headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
         )
         authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
+        with pytest.raises(exceptions.AuthenticationFailed):
+            _ = authentication.authenticate(request)
 
-    @pytest.mark.parametrize(
-        "request_uri,repo_slug",
-        [
-            ("/upload/github/ownerSEPARATORthe_repo/commits", "owner/the_repo"),
-            ("/upload/github/ownerSEPARATORthe_repo/commits/", "owner/the_repo"),
-            (
-                "/upload/github/ownerSEPARATORthe_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports",
-                "owner/the_repo",
-            ),
-            (
-                "/upload/github/ownerSEPARATORthe_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/",
-                "owner/the_repo",
-            ),
-            (
-                "/upload/github/ownerSEPARATORthe_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/default/uploads",
-                "owner/the_repo",
-            ),
-            (
-                "/upload/github/ownerSEPARATORthe_repo/commits/9652fb7ff577f554588ea83afded9000acd084ee/reports/default/uploads/",
-                "owner/the_repo",
-            ),
-            ("/upload/github/ownerSEPARATORexample-repo/commits", "owner/example-repo"),
-            (
-                "/upload/github/ownerSEPARATOR__example-repo__/commits",
-                "owner/__example-repo__",
-            ),
-            (
-                "/upload/github/ownerSEPARATOR~example-repo:copy/commits",
-                "owner/~example-repo:copy",
-            ),
-        ],
-    )
-    def test_tokenless_matches_paths(self, request_uri, repo_slug, db):
+    @pytest.mark.parametrize("request_uri,repo_slug,commitid", valid_params_to_test)
+    def test_tokenless_matches_paths(self, request_uri, repo_slug, commitid, db):
         author_name, repo_name = repo_slug.split("/")
-        # Doing this because of ATS.
-        # For pytest '::' is the divider between a test class and a test function.
-        # There's a non-zero chance that the full test name would be mis-interpreted by pytest
-        # And these tests would never work with ATS.
-        # Sadly there's no way to escape the '::' sequence
-        request_uri = request_uri.replace("SEPARATOR", "::::")
         repo = RepositoryFactory(
             name=repo_name, author__username=author_name, private=False
         )
         assert repo.service == "github"
         request = APIRequestFactory().post(
-            request_uri,
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
+            request_uri, {"branch": "fork:branch"}, format="json"
         )
         authentication = TokenlessAuthentication()
-        assert authentication._get_repo_info_from_request_path(request) == repo
+        assert authentication._get_info_from_request_path(request) == (repo, commitid)
 
-    def test_tokenless_private_repo(self, db):
-        repo = RepositoryFactory()
-        repo.private = True
-        assert repo.private == True
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("branch", ["branch", "fork:branch"])
+    @pytest.mark.parametrize(
+        "existing_commit,commit_branch",
+        [(False, None), (True, "branch"), (True, "fork:branch")],
+    )
+    def test_tokenless_success(
+        self,
+        db,
+        mocker,
+        private,
+        branch,
+        existing_commit,
+        commit_branch,
+    ):
+        repo = RepositoryFactory(private=private)
+
+        if existing_commit:
+            commit = CommitFactory()
+            commit.branch = commit_branch
+            commit.repository = repo
+            commit.save()
+
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits/{commit.commitid}/reports/report_code/uploads",
+                {"branch": branch},
+                format="json",
+            )
+
+        else:
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits",
+                {"branch": branch},
+                format="json",
+            )
+
+        authentication = TokenlessAuthentication()
+        expected = private is False and (
+            (existing_commit is False and ":" in branch)
+            or (existing_commit is True and ":" in commit_branch)
+        )
+
+        if expected:
+            res = authentication.authenticate(request)
+            assert res is not None
+            repo_as_user, auth_class = res
+
+            assert repo_as_user.is_authenticated() is expected
+            assert isinstance(auth_class, TokenlessAuth)
+        else:
+            with pytest.raises(exceptions.AuthenticationFailed):
+                res = authentication.authenticate(request)
+
+
+class TestUploadTokenRequiredAuthenticationCheck(object):
+    def test_token_not_required_bad_path(self):
+        request = APIRequestFactory().post(
+            "/endpoint",
+            headers={},
+        )
+        authentication = UploadTokenRequiredAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_bad_service(self):
+        request = APIRequestFactory().post(
+            "/upload/other/owner::::repo/commits/commit_sha/reports/report_code/uploads",
+            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
+        )
+        authentication = UploadTokenRequiredAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_unknown_repository(self, db):
+        an_owner = OwnerFactory(upload_token_required_for_public_repos=False)
+        # their repo
+        RepositoryFactory(author=an_owner, private=False)
+        request_uri = f"/upload/github/{an_owner.username}::::bad/commits"
+        request = APIRequestFactory().post(
+            request_uri, {"branch": "branch"}, format="json"
+        )
+        authentication = UploadTokenRequiredAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_unknown_owner(self, db):
+        repo = RepositoryFactory(
+            private=False, author__upload_token_required_for_public_repos=False
+        )
+        request_uri = f"/upload/github/bad::::{repo.name}/commits"
+        request = APIRequestFactory().post(
+            request_uri, {"branch": "branch"}, format="json"
+        )
+        authentication = UploadTokenRequiredAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    @pytest.mark.parametrize("request_uri,repo_slug,commitid", valid_params_to_test)
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("token_required", [False, True])
+    def test_get_repository_and_owner(
+        self, request_uri, repo_slug, commitid, private, token_required, db
+    ):
+        author_name, repo_name = repo_slug.split("/")
+        repo = RepositoryFactory(
+            name=repo_name,
+            author__username=author_name,
+            private=private,
+            author__upload_token_required_for_public_repos=token_required,
+        )
         assert repo.service == "github"
         request = APIRequestFactory().post(
-            f"/upload/github/{repo.author.username}::::{repo.name}/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
+            request_uri, {"branch": "fork:branch"}, format="json"
         )
-        authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
+        authentication = UploadTokenRequiredAuthenticationCheck()
+        assert authentication.get_repository_and_owner(request) == (
+            repo,
+            repo.author,
+        )
 
-    @patch("codecov_auth.authentication.repo_auth.RepoProviderService")
-    def test_tokenless_pr_not_found(self, mock_repo_provider, db, mocker):
-        mocker.patch.object(
-            TOKENLESS_AUTH_BY_OWNER_SLUG, "check_value", return_value=True
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("branch", ["branch", "fork:branch"])
+    @pytest.mark.parametrize(
+        "existing_commit,commit_branch",
+        [(False, None), (True, "branch"), (True, "fork:branch")],
+    )
+    @pytest.mark.parametrize("token_required", [False, True])
+    def test_token_not_required_fork_branch_public_private(
+        self,
+        db,
+        mocker,
+        private,
+        branch,
+        existing_commit,
+        commit_branch,
+        token_required,
+    ):
+        repo = RepositoryFactory(
+            private=private,
+            author__upload_token_required_for_public_repos=token_required,
         )
-        repo = RepositoryFactory(private=False)
-        mock_adapter = MagicMock(
-            name="mock_provider_adapter",
-            get_pull_request=MagicMock(
-                name="mock_get_pr", side_effect=TorngitObjectNotFoundError({}, "oh no")
-            ),
-        )
-        mock_repo_provider.return_value.get_adapter.return_value = mock_adapter
 
+        if existing_commit:
+            commit = CommitFactory()
+            commit.branch = commit_branch
+            commit.repository = repo
+            commit.save()
+
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits/{commit.commitid}/reports/report_code/uploads",
+                {"branch": branch},
+                format="json",
+            )
+
+        else:
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits",
+                {"branch": branch},
+                format="json",
+            )
+
+        authentication = UploadTokenRequiredAuthenticationCheck()
+
+        if not private and not token_required:
+            res = authentication.authenticate(request)
+            assert res is not None
+            repo_as_user, auth_class = res
+
+            assert repo_as_user.is_authenticated() is True
+            assert isinstance(auth_class, TokenlessAuth)
+        else:
+            res = authentication.authenticate(request)
+            assert res is None
+
+
+class TestUploadTokenRequiredGetFromBodyAuthenticationCheck(object):
+    def test_token_not_required_invalid_data(self):
         request = APIRequestFactory().post(
-            f"/upload/github/{repo.author.username}::::{repo.name}/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
+            "/endpoint",
+            data={"slug": 123, "git_service": "github"},
+            format="json",
         )
-        authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
-        mock_adapter.get_pull_request.assert_called_with("15")
-
-    @patch("codecov_auth.authentication.repo_auth.RepoProviderService")
-    def test_tokenless_pr_from_different_fork(self, mock_repo_provider, db, mocker):
-        repo = RepositoryFactory(private=False)
-        pr_info = {
-            "base": {"slug": f"{repo.author.username}/{repo.name}"},
-            "head": {"slug": f"some-user/{repo.name}"},
-        }
-        mock_adapter = MagicMock(
-            name="mock_provider_adapter",
-            get_pull_request=AsyncMock(name="mock_get_pr", return_value=pr_info),
-        )
-        mock_repo_provider.return_value.get_adapter.return_value = mock_adapter
-        mocker.patch.object(
-            TOKENLESS_AUTH_BY_OWNER_SLUG, "check_value", return_value=True
-        )
-        request = APIRequestFactory().post(
-            f"/upload/github/{repo.author.username}::::{repo.name}/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": "user-name/repo-forked", "X-Tokenless-PR": "15"},
-        )
-        authentication = TokenlessAuthentication()
-        with pytest.raises(exceptions.AuthenticationFailed) as exp:
-            authentication.authenticate(request)
-        assert str(exp.value) == "Not valid tokenless upload"
-        mock_adapter.get_pull_request.assert_called_with("15")
-
-    @patch("codecov_auth.authentication.repo_auth.RepoProviderService")
-    def test_tokenless_success(self, mock_repo_provider, db, mocker):
-        repo = RepositoryFactory(private=False)
-        pr_info = {
-            "base": {"slug": f"{repo.author.username}/{repo.name}"},
-            "head": {"slug": f"some-user/{repo.name}"},
-        }
-        mocker.patch.object(
-            TOKENLESS_AUTH_BY_OWNER_SLUG, "check_value", return_value=True
-        )
-        mock_adapter = MagicMock(
-            name="mock_provider_adapter",
-            get_pull_request=AsyncMock(name="mock_get_pr", return_value=pr_info),
-        )
-        mock_repo_provider.return_value.get_adapter.return_value = mock_adapter
-
-        request = APIRequestFactory().post(
-            f"/upload/github/{repo.author.username}::::{repo.name}/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": f"some-user/{repo.name}", "X-Tokenless-PR": "15"},
-        )
-        authentication = TokenlessAuthentication()
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
         res = authentication.authenticate(request)
-        assert res is not None
-        repo_as_user, auth_class = res
-        assert repo_as_user.is_authenticated()
-        assert isinstance(auth_class, TokenlessAuth)
-        mock_adapter.get_pull_request.assert_called_with("15")
+        assert res is None
 
-    @patch("codecov_auth.authentication.repo_auth.RepoProviderService")
-    def test_tokenless_success_no_mocker_flag(self, mock_repo_provider, db):
-        repo = RepositoryFactory(private=False, author__username="codecov")
-        random_repo = RepositoryFactory()
-        pr_info = {
-            "base": {"slug": f"{repo.author.username}/{repo.name}"},
-            "head": {"slug": f"some-user/{repo.name}"},
-        }
-        mock_adapter = MagicMock(
-            name="mock_provider_adapter",
-            get_pull_request=AsyncMock(name="mock_get_pr", return_value=pr_info),
+    def test_token_not_required_no_data(self):
+        request = APIRequestFactory().post(
+            "/endpoint",
+            format="json",
         )
-        mock_repo_provider.return_value.get_adapter.return_value = mock_adapter
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_no_git_service(self, db):
+        owner = OwnerFactory(upload_token_required_for_public_repos=False)
+        # their repo
+        repo = RepositoryFactory(author=owner, private=False)
+        request_uri = f"/upload/github/{owner.username}::::{repo.name}/commits"
+        request = APIRequestFactory().post(
+            request_uri,
+            data={
+                "slug": f"{owner.username}::::{repo.name}",
+            },
+            format="json",
+        )
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+        assert authentication.get_repository_and_owner(request) == (None, None)
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_unknown_repository(self, db):
+        an_owner = OwnerFactory(upload_token_required_for_public_repos=False)
+        # their repo
+        RepositoryFactory(author=an_owner, private=False)
+        request_uri = f"/upload/github/{an_owner.username}::::bad/commits"
+        request = APIRequestFactory().post(
+            request_uri,
+            data={
+                "slug": f"{an_owner.username}::::bad",
+                "service": an_owner.service,
+            },
+            format="json",
+        )
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+        assert authentication.get_repository_and_owner(request) == (None, None)
+        res = authentication.authenticate(request)
+        assert res is None
+
+    def test_token_not_required_unknown_owner(self, db):
+        repo = RepositoryFactory(
+            private=False, author__upload_token_required_for_public_repos=False
+        )
+        request_uri = f"/upload/github/bad::::{repo.name}/commits"
+        request = APIRequestFactory().post(
+            request_uri,
+            data={
+                "slug": f"bad::::{repo.name}",
+                "service": "github",
+            },
+            format="json",
+        )
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+        res = authentication.authenticate(request)
+        assert res is None
+
+    @pytest.mark.parametrize("request_uri,repo_slug,commitid", valid_params_to_test)
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("token_required", [False, True])
+    def test_get_repository_and_owner(
+        self, request_uri, repo_slug, commitid, private, token_required, db
+    ):
+        author_name, repo_name = repo_slug.split("/")
+        repo = RepositoryFactory(
+            name=repo_name,
+            author__username=author_name,
+            private=private,
+            author__upload_token_required_for_public_repos=token_required,
+        )
+        assert repo.service == "github"
+        request = APIRequestFactory().post(
+            request_uri,
+            data={"slug": f"{author_name}::::{repo_name}", "service": "github"},
+            format="json",
+        )
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+
+        assert authentication.get_repository_and_owner(request) == (
+            repo,
+            repo.author,
+        )
+
+    def test_get_repository_and_owner_with_service(self, db):
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+        repo_name = "the-repo"
+        owner_username = "the-author"
+        for name, _ in Service.choices:
+            owner = OwnerFactory(service=name, username=owner_username)
+            RepositoryFactory(name=repo_name, author=owner)
 
         request = APIRequestFactory().post(
-            f"/upload/github/{repo.author.username}::::{repo.name}/commits/commit_sha/reports/report_code/uploads",
-            headers={"X-Tokenless": f"some-user/{repo.name}", "X-Tokenless-PR": "15"},
+            "endpoint/",
+            data={
+                "slug": f"{owner_username}::::{repo_name}",
+                "git_service": Service.BITBUCKET.value,
+            },
+            format="json",
         )
-        authentication = TokenlessAuthentication()
-        res = authentication.authenticate(request)
-        assert res is not None
-        repo_as_user, auth_class = res
-        assert repo_as_user.is_authenticated()
-        assert isinstance(auth_class, TokenlessAuth)
-        assert auth_class.get_repositories() == [repo]
-        assert auth_class.allows_repo(repo)
-        assert not auth_class.allows_repo(random_repo)
-        assert auth_class.get_scopes() == ["upload"]
-        mock_adapter.get_pull_request.assert_called_with("15")
+        matching_owner = Owner.objects.get(
+            service=Service.BITBUCKET.value, username=owner_username
+        )
+        matching_repo = Repository.objects.get(
+            name=repo_name, author__service=Service.BITBUCKET.value
+        )
+        assert authentication.get_repository_and_owner(request) == (
+            matching_repo,
+            matching_owner,
+        )
+
+        request = APIRequestFactory().post(
+            "endpoint/",
+            data={
+                "slug": f"{owner_username}::::{repo_name}",
+                "git_service": Service.GITLAB.value,
+            },
+            format="json",
+        )
+        matching_owner = Owner.objects.get(
+            service=Service.GITLAB.value, username=owner_username
+        )
+        matching_repo = Repository.objects.get(
+            name=repo_name, author__service=Service.GITLAB.value
+        )
+        assert authentication.get_repository_and_owner(request) == (
+            matching_repo,
+            matching_owner,
+        )
+
+        request = APIRequestFactory().post(
+            "endpoint/",
+            data={
+                "slug": f"{owner_username}::::{repo_name}",
+                "git_service": Service.GITHUB.value,
+            },
+            format="json",
+        )
+        matching_owner = Owner.objects.get(
+            service=Service.GITHUB.value, username=owner_username
+        )
+        matching_repo = Repository.objects.get(
+            name=repo_name, author__service=Service.GITHUB.value
+        )
+        assert authentication.get_repository_and_owner(request) == (
+            matching_repo,
+            matching_owner,
+        )
+
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("branch", ["branch", "fork:branch"])
+    @pytest.mark.parametrize(
+        "existing_commit,commit_branch",
+        [(False, None), (True, "branch"), (True, "fork:branch")],
+    )
+    @pytest.mark.parametrize("token_required", [False, True])
+    def test_token_not_required_fork_branch_public_private(
+        self,
+        db,
+        mocker,
+        private,
+        branch,
+        existing_commit,
+        commit_branch,
+        token_required,
+    ):
+        repo = RepositoryFactory(
+            private=private,
+            author__upload_token_required_for_public_repos=token_required,
+        )
+
+        if existing_commit:
+            commit = CommitFactory()
+            commit.branch = commit_branch
+            commit.repository = repo
+            commit.save()
+
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits/{commit.commitid}/reports/report_code/uploads",
+                data={
+                    "slug": f"{repo.author.username}::::{repo.name}",
+                    "git_service": repo.author.service,
+                },
+                format="json",
+            )
+
+        else:
+            request = APIRequestFactory().post(
+                f"/upload/github/{repo.author.username}::::{repo.name}/commits",
+                data={
+                    "slug": f"{repo.author.username}::::{repo.name}",
+                    "git_service": repo.author.service,
+                },
+                format="json",
+            )
+
+        authentication = UploadTokenRequiredGetFromBodyAuthenticationCheck()
+
+        if not private and not token_required:
+            res = authentication.authenticate(request)
+            assert res is not None
+            repo_as_user, auth_class = res
+
+            assert repo_as_user.is_authenticated() is True
+            assert isinstance(auth_class, TokenlessAuth)
+        else:
+            res = authentication.authenticate(request)
+            assert res is None

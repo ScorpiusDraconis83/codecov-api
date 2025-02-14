@@ -1,14 +1,12 @@
 from datetime import datetime
-from operator import xor
 from unittest.mock import MagicMock
 
 import pytest
-from celery import Task
 from django.conf import settings
 from freezegun import freeze_time
 from shared import celery_config
+from shared.django_apps.core.tests.factories import RepositoryFactory
 
-from core.tests.factories import RepositoryFactory
 from services.task import TaskService, celery_app
 from timeseries.tests.factories import DatasetFactory
 
@@ -175,9 +173,7 @@ def test_backfill_repo(mocker):
 @freeze_time("2023-06-13T10:01:01.000123")
 def test_backfill_dataset(mocker):
     signature_mock = mocker.patch("services.task.task.signature")
-    mock_route_task = mocker.patch(
-        "services.task.task.route_task", return_value={"queue": "celery"}
-    )
+    mocker.patch("services.task.task.route_task", return_value={"queue": "celery"})
     signature = MagicMock()
     signature_mock.return_value = signature
 
@@ -323,35 +319,6 @@ def test_make_http_request_task(mocker):
         queue="celery",
         soft_time_limit=None,
         time_limit=None,
-        headers=dict(created_timestamp="2023-06-13T10:01:01.000123"),
-        immutable=False,
-    )
-
-
-@freeze_time("2023-06-13T10:01:01.000123")
-def test_backfill_commit_data_task(mocker):
-    signature_mock = mocker.patch("services.task.task.signature")
-    mock_route_task = mocker.patch(
-        "services.task.task.route_task",
-        return_value={
-            "queue": "celery",
-            "extra_config": {"soft_timelimit": 300, "hard_timelimit": 400},
-        },
-    )
-    TaskService().backfill_commit_data(123)
-    mock_route_task.assert_called_with(
-        "app.tasks.archive.BackfillCommitDataToStorage",
-        args=None,
-        kwargs=dict(commitid=123),
-    )
-    signature_mock.assert_called_with(
-        "app.tasks.archive.BackfillCommitDataToStorage",
-        args=None,
-        kwargs=dict(commitid=123),
-        app=celery_app,
-        queue="celery",
-        soft_time_limit=300,
-        time_limit=400,
         headers=dict(created_timestamp="2023-06-13T10:01:01.000123"),
         immutable=False,
     )

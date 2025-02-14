@@ -4,20 +4,47 @@ from unittest.mock import patch
 import jwt
 import pytest
 from django.conf import settings
+from django.test import TestCase
 from rest_framework.exceptions import Throttled, ValidationError
-from shared.config import get_config
-from shared.github import InvalidInstallationError
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
+from shared.django_apps.reports.models import ReportType
+from shared.plan.constants import DEFAULT_FREE_PLAN
+from shared.upload.utils import UploaderType, insert_coverage_measurement
 
-from core.tests.factories import CommitFactory, OwnerFactory, RepositoryFactory
-from plan.constants import PlanName
+from billing.helpers import mock_all_plans_and_tiers
+from codecov_auth.models import GithubAppInstallation, Service
 from reports.tests.factories import CommitReportFactory, UploadFactory
 from upload.helpers import (
     check_commit_upload_constraints,
     determine_repo_for_upload,
+    ghapp_installation_id_to_use,
     try_to_get_best_possible_bot_token,
     validate_activated_repo,
     validate_upload,
 )
+
+
+class TestGithubAppInstallationUsage(TestCase):
+    def test_not_github_provider(self):
+        repo = RepositoryFactory(author__service=Service.GITLAB.value)
+        assert ghapp_installation_id_to_use(repo) is None
+
+    def test_github_app_installation_flow(self):
+        owner = OwnerFactory(service=Service.GITHUB.value, integration_id=None)
+        covered_repo = RepositoryFactory(author=owner)
+        not_covered_repo = RepositoryFactory(author=owner)
+        ghapp_installation = GithubAppInstallation(
+            owner=owner,
+            repository_service_ids=[covered_repo.service_id],
+            installation_id=200,
+        )
+        ghapp_installation.save()
+        assert ghapp_installation_id_to_use(covered_repo) == 200
+        assert ghapp_installation_id_to_use(not_covered_repo) is None
 
 
 def test_try_to_get_best_possible_bot_token_no_repobot_no_ownerbot(db):
@@ -72,7 +99,9 @@ def test_try_to_get_best_possible_bot_token_using_integration(
     assert try_to_get_best_possible_bot_token(repository) == {
         "key": "test-token",
     }
-    get_github_integration_token.assert_called_once_with("github", integration_id=12345)
+    get_github_integration_token.assert_called_once_with(
+        "github", installation_id=12345
+    )
 
 
 @patch("upload.helpers.get_github_integration_token")
@@ -80,7 +109,11 @@ def test_try_to_get_best_possible_bot_token_using_integration(
 def test_try_to_get_best_possible_bot_token_using_invalid_integration(
     get_github_integration_token,
 ):
-    get_github_integration_token.side_effect = InvalidInstallationError()
+    from shared.github import InvalidInstallationError  # circular imports
+
+    get_github_integration_token.side_effect = InvalidInstallationError(
+        error_cause="installation_not_found"
+    )
     bot = OwnerFactory.create(unencrypted_oauth_token="bornana")
     bot.save()
     owner = OwnerFactory.create(integration_id=12345, bot=bot)
@@ -92,7 +125,9 @@ def test_try_to_get_best_possible_bot_token_using_invalid_integration(
         "key": "bornana",
         "secret": None,
     }
-    get_github_integration_token.assert_called_once_with("github", integration_id=12345)
+    get_github_integration_token.assert_called_once_with(
+        "github", installation_id=12345
+    )
 
 
 def test_try_to_get_best_possible_nothing_and_is_private(db):
@@ -116,9 +151,7 @@ def test_try_to_get_best_possible_nothing_and_not_private(db, mocker):
 
 def test_check_commit_constraints_settings_disabled(db, settings):
     settings.UPLOAD_THROTTLING_ENABLED = False
-    repository = RepositoryFactory.create(
-        author__plan=PlanName.BASIC_PLAN_NAME.value, private=True
-    )
+    repository = RepositoryFactory.create(author__plan=DEFAULT_FREE_PLAN, private=True)
     first_commit = CommitFactory.create(repository=repository)
     second_commit = CommitFactory.create(repository=repository)
     third_commit = CommitFactory.create(repository__author=repository.author)
@@ -133,9 +166,10 @@ def test_check_commit_constraints_settings_disabled(db, settings):
     check_commit_upload_constraints(third_commit)
 
 
-def test_check_commit_constraints_settings_enabled(db, settings):
+def test_check_commit_constraints_settings_enabled(db, settings, mocker):
     settings.UPLOAD_THROTTLING_ENABLED = True
-    author = OwnerFactory.create(plan=PlanName.BASIC_PLAN_NAME.value)
+    mock_all_plans_and_tiers()
+    author = OwnerFactory.create(plan=DEFAULT_FREE_PLAN)
     repository = RepositoryFactory.create(author=author, private=True)
     public_repository = RepositoryFactory.create(author=author, private=False)
     first_commit = CommitFactory.create(repository=repository)
@@ -144,16 +178,48 @@ def test_check_commit_constraints_settings_enabled(db, settings):
     fourth_commit = CommitFactory.create(repository=repository)
     public_repository_commit = CommitFactory.create(repository=public_repository)
     unrelated_commit = CommitFactory.create()
-    first_report = CommitReportFactory.create(commit=first_commit)
-    fourth_report = CommitReportFactory.create(commit=fourth_commit)
+    first_report = CommitReportFactory.create(
+        commit=first_commit, report_type=ReportType.COVERAGE.value
+    )
+    fourth_report = CommitReportFactory.create(
+        commit=fourth_commit, report_type=ReportType.COVERAGE.value
+    )
     check_commit_upload_constraints(second_commit)
     for i in range(300):
         UploadFactory.create(report__commit__repository=public_repository)
-    # ensuring public repos counts don't count torwards the quota
+        first_upload = UploadFactory(report=first_report)
+        insert_coverage_measurement(
+            owner_id=author.ownerid,
+            repo_id=public_repository.repoid,
+            commit_id=public_repository_commit.id,
+            upload_id=first_upload.id,
+            uploader_used=UploaderType.CLI.value,
+            private_repo=public_repository.private,
+            report_type=first_report.report_type,
+        )
+    # ensuring public repos counts don't count towards the quota
     check_commit_upload_constraints(second_commit)
     for i in range(150):
-        UploadFactory.create(report=first_report)
-        UploadFactory.create(report=fourth_report)
+        another_first_upload = UploadFactory.create(report=first_report)
+        insert_coverage_measurement(
+            owner_id=author.ownerid,
+            repo_id=repository.repoid,
+            commit_id=first_commit.id,
+            upload_id=another_first_upload.id,
+            uploader_used=UploaderType.CLI.value,
+            private_repo=repository.private,
+            report_type=first_report.report_type,
+        )
+        fourth_upload = UploadFactory.create(report=fourth_report)
+        insert_coverage_measurement(
+            owner_id=author.ownerid,
+            repo_id=repository.repoid,
+            commit_id=fourth_commit.id,
+            upload_id=fourth_upload.id,
+            uploader_used=UploaderType.CLI.value,
+            private_repo=repository.private,
+            report_type=fourth_report.report_type,
+        )
     # first and fourth commit already has uploads made, we won't block uploads to them
     check_commit_upload_constraints(first_commit)
     check_commit_upload_constraints(fourth_commit)
@@ -193,12 +259,12 @@ def test_validate_upload_too_many_uploads_for_commit(
 
 def test_deactivated_repo(db, mocker):
     repository = RepositoryFactory.create(active=True, activated=False)
-    settings_url = f"{settings.CODECOV_DASHBOARD_URL}/{repository.author.service}/{repository.author.username}/{repository.name}/settings"
+    config_url = f"{settings.CODECOV_DASHBOARD_URL}/{repository.author.service}/{repository.author.username}/{repository.name}/config/general"
 
     with pytest.raises(ValidationError) as exp:
         validate_activated_repo(repository)
     assert exp.match(
-        f"This repository has been deactivated. To resume uploading to it, please activate the repository in the codecov UI: {settings_url}"
+        f"This repository is deactivated. To resume uploading to it, please activate the repository in the codecov UI: {config_url}"
     )
 
 
@@ -269,8 +335,8 @@ def test_determine_repo_for_upload_github_actions(codecov_vcr):
     repository = RepositoryFactory.create()
     token = jwt.encode(
         {
-            "iss": "https://token.actions.githubusercontent.com",
-            "aud": get_config("setup", "codecov_url"),
+            "iss": "https://token.actions.githubusercontent.com/abcdefg",
+            "aud": [f"{settings.CODECOV_API_URL}"],
             "repository": f"{repository.author.username}/{repository.name}",
             "repository_owner": repository.author.username,
         },

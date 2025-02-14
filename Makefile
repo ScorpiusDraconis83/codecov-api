@@ -21,7 +21,7 @@ API_DOMAIN ?= api
 PROXY_NETWORK ?= api_default
 
 # Codecov CLI version to use
-CODECOV_CLI_VERSION := 0.4.1
+CODECOV_CLI_VERSION := 0.5.1
 
 build:
 	make build.requirements
@@ -31,37 +31,37 @@ check-for-migration-conflicts:
 	python manage.py check_for_migration_conflicts
 
 test:
-	python -m pytest --cov=./
+	COVERAGE_CORE=sysmon python -m pytest --cov=./ --junitxml=junit.xml -o junit_family=legacy
 
 test.unit:
-	python -m pytest --cov=./ -m "not integration" --cov-report=xml:unit.coverage.xml
+	COVERAGE_CORE=sysmon python -m pytest --cov=./ -m "not integration" --cov-report=xml:unit.coverage.xml --junitxml=unit.junit.xml -o junit_family=legacy
 
 test.integration:
-	python -m pytest --cov=./ -m "integration" --cov-report=xml:integration.coverage.xml
+	COVERAGE_CORE=sysmon python -m pytest --cov=./ -m "integration" --cov-report=xml:integration.coverage.xml --junitxml=integration.junit.xml -o junit_family=legacy
 
 lint:
 	make lint.install
 	make lint.run
 
 lint.install:
-	python -m pip install --upgrade pip
 	echo "Installing..."
-	pip install -Iv black==22.3.0 isort
+	pip install -Iv ruff
 
 lint.run:
-	black .
-	isort --profile black .
+	ruff check
+	ruff format
 
 lint.check:
 	echo "Linting..."
-	black --check .
-	echo "Sorting..."
-	isort --profile black --check .
+	ruff check
+	echo "Formatting..."
+	ruff format --check
 
 build.requirements:
 	# if docker pull succeeds, we have already build this version of
 	# requirements.txt.  Otherwise, build and push a version tagged
 	# with the hash of this requirements.txt
+	touch .testenv
 	docker pull ${AR_REPO}:${REQUIREMENTS_TAG} || docker build \
 		-f docker/Dockerfile.requirements . \
 		-t ${AR_REPO}:${REQUIREMENTS_TAG} \
@@ -78,6 +78,10 @@ build.app:
 	docker build -f docker/Dockerfile . \
 		-t ${AR_REPO}:latest \
 		-t ${AR_REPO}:${VERSION} \
+		--label "org.label-schema.vendor"="Codecov" \
+		--label "org.label-schema.version"="${release_version}-${sha}" \
+		--label "org.opencontainers.image.revision"="$(long_sha)" \
+		--label "org.opencontainers.image.source"="github.com/codecov/codecov-api" \
 		--build-arg REQUIREMENTS_IMAGE=${AR_REPO}:${REQUIREMENTS_TAG} \
 		--build-arg RELEASE_VERSION=${VERSION} \
 		--build-arg BUILD_ENV=cloud
@@ -98,6 +102,8 @@ build.self-hosted-runtime:
 	docker build -f docker/Dockerfile . \
 		-t ${DOCKERHUB_REPO}:latest \
 		-t ${DOCKERHUB_REPO}:${VERSION} \
+		--label "org.label-schema.vendor"="Codecov" \
+		--label "org.label-schema.version"="${release_version}-${sha}" \
 		--build-arg REQUIREMENTS_IMAGE=${AR_REPO}:${REQUIREMENTS_TAG} \
         --build-arg RELEASE_VERSION=${VERSION} \
         --build-arg BUILD_ENV=self-hosted-runtime
@@ -172,6 +178,9 @@ push.self-hosted-rolling:
 	docker push ${DOCKERHUB_REPO}:rolling_no_dependencies
 	docker push ${DOCKERHUB_REPO}:rolling
 
+shell:
+	docker-compose exec api bash
+	
 test_env.up:
 	env | grep GITHUB > .testenv; true
 	TIMESERIES_ENABLED=${TIMESERIES_ENABLED} docker-compose up -d
@@ -187,7 +196,7 @@ test_env.install_cli:
 	pip install codecov-cli==$(CODECOV_CLI_VERSION)
 
 test_env.container_prepare:
-	apk add -U curl git build-base jq
+	apt-get -y install git build-essential netcat-traditional
 	make test_env.install_cli
 	git config --global --add safe.directory /app
 
@@ -207,11 +216,17 @@ test_env.check-for-migration-conflicts:
 
 test_env.upload:
 	docker-compose exec api make test_env.container_upload CODECOV_UPLOAD_TOKEN=${CODECOV_UPLOAD_TOKEN} CODECOV_URL=${CODECOV_URL}
+	docker-compose exec api make test_env.container_upload_test_results CODECOV_UPLOAD_TOKEN=${CODECOV_UPLOAD_TOKEN} CODECOV_URL=${CODECOV_URL}
 
 test_env.container_upload:
 	codecovcli -u ${CODECOV_URL} upload-process --flag unit-latest-uploader --flag unit  \
 	--coverage-files-search-exclude-folder=graphql_api/types/** \
 	--coverage-files-search-exclude-folder=api/internal/tests/unit/views/cassetes/**
+
+test_env.container_upload_test_results:
+	codecovcli -u ${CODECOV_URL} do-upload --report-type "test_results" \
+	--files-search-exclude-folder=graphql_api/types/** \
+	--files-search-exclude-folder=api/internal/tests/unit/views/cassetes/** || true
 
 test_env.static_analysis:
 	docker-compose exec api make test_env.container_static_analysis CODECOV_STATIC_TOKEN=${CODECOV_STATIC_TOKEN}

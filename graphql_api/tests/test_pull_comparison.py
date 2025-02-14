@@ -2,14 +2,17 @@ from collections import namedtuple
 from unittest.mock import PropertyMock, patch
 
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import (
+    CommitWithReportFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
 from shared.reports.types import ReportTotals
 from shared.utils.merge import LineType
 
-import services.comparison as comparison
-from codecov_auth.tests.factories import OwnerFactory
 from compare.models import CommitComparison
 from compare.tests.factories import CommitComparisonFactory, FlagComparisonFactory
-from core.tests.factories import CommitWithReportFactory, PullFactory, RepositoryFactory
 from reports.tests.factories import RepositoryFlagFactory
 from services.profiling import CriticalFile
 
@@ -267,6 +270,58 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
             }
         }
 
+    def test_pull_flag_comparisons_with_filter(self):
+        FlagComparisonFactory(
+            commit_comparison=self.commit_comparison,
+            repositoryflag=RepositoryFlagFactory(
+                repository=self.repository, flag_name="flag_one"
+            ),
+            head_totals={"coverage": "85.71429"},
+            base_totals={"coverage": "92.2973"},
+            patch_totals={"coverage": "29.28364"},
+        )
+        FlagComparisonFactory(
+            commit_comparison=self.commit_comparison,
+            repositoryflag=RepositoryFlagFactory(
+                repository=self.repository, flag_name="flag_two"
+            ),
+            head_totals={"coverage": "75.273820"},
+            base_totals={"coverage": "16.293"},
+            patch_totals={"coverage": "68.283496"},
+        )
+        query = """
+            compareWithBase {
+                ... on Comparison {
+                    flagComparisons(filters: { term: "flag_two"}) {
+                        name
+                        patchTotals {
+                            percentCovered
+                        }
+                        headTotals {
+                            percentCovered
+                        }
+                        baseTotals {
+                            percentCovered
+                        }
+                    }
+                }
+            }
+        """
+
+        res = self._request(query)
+        assert res == {
+            "compareWithBase": {
+                "flagComparisons": [
+                    {
+                        "name": "flag_two",
+                        "patchTotals": {"percentCovered": 68.283496},
+                        "headTotals": {"percentCovered": 75.27382},
+                        "baseTotals": {"percentCovered": 16.293},
+                    },
+                ],
+            }
+        }
+
     @patch(
         "services.comparison.Comparison.has_different_number_of_head_and_base_sessions",
         new_callable=PropertyMock,
@@ -357,35 +412,42 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
             pullId
             compareWithBase {
                 ... on Comparison {
-                    impactedFilesDeprecated {
-                        baseName
-                        headName
-                        isNewFile
-                        isRenamedFile
-                        isDeletedFile
-                        baseCoverage {
-                            percentCovered
-                            fileCount
-                            lineCount
-                            hitsCount
-                            missesCount
-                            partialsCount
+                    impactedFiles(filters:{}) {
+                        ... on ImpactedFiles {
+                            results {
+                                baseName
+                                headName
+                                isNewFile
+                                isRenamedFile
+                                isDeletedFile
+                                baseCoverage {
+                                    percentCovered
+                                    fileCount
+                                    lineCount
+                                    hitsCount
+                                    missesCount
+                                    partialsCount
+                                }
+                                headCoverage {
+                                    percentCovered
+                                    fileCount
+                                    lineCount
+                                    hitsCount
+                                    missesCount
+                                    partialsCount
+                                }
+                                patchCoverage {
+                                    percentCovered
+                                    fileCount
+                                    lineCount
+                                    hitsCount
+                                    missesCount
+                                    partialsCount
+                                }
+                            }
                         }
-                        headCoverage {
-                            percentCovered
-                            fileCount
-                            lineCount
-                            hitsCount
-                            missesCount
-                            partialsCount
-                        }
-                        patchCoverage {
-                            percentCovered
-                            fileCount
-                            lineCount
-                            hitsCount
-                            missesCount
-                            partialsCount
+                        ... on UnknownFlags {
+                            message
                         }
                     }
                 }
@@ -421,28 +483,30 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
         assert res == {
             "pullId": self.pull.pullid,
             "compareWithBase": {
-                "impactedFilesDeprecated": [
-                    {
-                        "baseName": "foo.py",
-                        "headName": "bar.py",
-                        "isNewFile": False,
-                        "isRenamedFile": True,
-                        "isDeletedFile": False,
-                        "baseCoverage": base_totals,
-                        "headCoverage": head_totals,
-                        "patchCoverage": patch_totals,
-                    },
-                    {
-                        "baseName": None,
-                        "headName": "baz.py",
-                        "isNewFile": True,
-                        "isRenamedFile": False,
-                        "isDeletedFile": False,
-                        "baseCoverage": base_totals,
-                        "headCoverage": head_totals,
-                        "patchCoverage": patch_totals,
-                    },
-                ]
+                "impactedFiles": {
+                    "results": [
+                        {
+                            "baseName": "foo.py",
+                            "headName": "bar.py",
+                            "isNewFile": False,
+                            "isRenamedFile": True,
+                            "isDeletedFile": False,
+                            "baseCoverage": base_totals,
+                            "headCoverage": head_totals,
+                            "patchCoverage": patch_totals,
+                        },
+                        {
+                            "baseName": None,
+                            "headName": "baz.py",
+                            "isNewFile": True,
+                            "isRenamedFile": False,
+                            "isDeletedFile": False,
+                            "baseCoverage": base_totals,
+                            "headCoverage": head_totals,
+                            "patchCoverage": patch_totals,
+                        },
+                    ]
+                },
             },
         }
 
@@ -474,10 +538,17 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
             pullId
             compareWithBase {
                 ... on Comparison {
-                    impactedFilesDeprecated {
-                        baseName
-                        headName
-                        isCriticalFile
+                    impactedFiles(filters:{}) {
+                        ... on ImpactedFiles {
+                            results {
+                                baseName
+                                headName
+                                isCriticalFile
+                            }
+                        }
+                        ... on UnknownFlags {
+                            message
+                        }
                     }
                 }
             }
@@ -487,18 +558,20 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
         assert res == {
             "pullId": self.pull.pullid,
             "compareWithBase": {
-                "impactedFilesDeprecated": [
-                    {
-                        "baseName": "foo.py",
-                        "headName": "bar.py",
-                        "isCriticalFile": True,
-                    },
-                    {
-                        "baseName": None,
-                        "headName": "baz.py",
-                        "isCriticalFile": False,
-                    },
-                ]
+                "impactedFiles": {
+                    "results": [
+                        {
+                            "baseName": "foo.py",
+                            "headName": "bar.py",
+                            "isCriticalFile": True,
+                        },
+                        {
+                            "baseName": None,
+                            "headName": "baz.py",
+                            "isCriticalFile": False,
+                        },
+                    ]
+                },
             },
         }
 
@@ -529,10 +602,17 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
                                         pullId
                                         compareWithBase {
                                             ... on Comparison {
-                                                impactedFilesDeprecated {
-                                                    baseName
-                                                    headName
-                                                    isCriticalFile
+                                                impactedFiles(filters:{}) {
+                                                    ... on ImpactedFiles {
+                                                        results {
+                                                            baseName
+                                                            headName
+                                                            isCriticalFile
+                                                        }
+                                                    }
+                                                    ... on UnknownFlags {
+                                                        message
+                                                    }
                                                 }
                                             }
                                         }
@@ -557,13 +637,15 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
                                     "pull": {
                                         "pullId": 2,
                                         "compareWithBase": {
-                                            "impactedFilesDeprecated": [
-                                                {
-                                                    "baseName": "foo.py",
-                                                    "headName": "bar.py",
-                                                    "isCriticalFile": False,
-                                                }
-                                            ]
+                                            "impactedFiles": {
+                                                "results": [
+                                                    {
+                                                        "baseName": "foo.py",
+                                                        "headName": "bar.py",
+                                                        "isCriticalFile": False,
+                                                    }
+                                                ]
+                                            },
                                         },
                                     }
                                 }
@@ -673,25 +755,32 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
             pullId
             compareWithBase {
                 ... on Comparison {
-                    impactedFilesDeprecated {
-                        segments {
-                            ... on SegmentComparisons {
-                                results {
-                                    header
-                                    hasUnintendedChanges
-                                    lines {
-                                        baseNumber
-                                        headNumber
-                                        baseCoverage
-                                        headCoverage
-                                        content
-                                        coverageInfo(ignoredUploadIds: [1]) {
-                                            hitCount
-                                            hitUploadIds
+                    impactedFiles(filters: {}){
+                        ... on ImpactedFiles {
+                            results {
+                                segments {
+                                    ... on SegmentComparisons {
+                                        results {
+                                            header
+                                            hasUnintendedChanges
+                                            lines {
+                                                baseNumber
+                                                headNumber
+                                                baseCoverage
+                                                headCoverage
+                                                content
+                                                coverageInfo(ignoredUploadIds: [1]) {
+                                                    hitCount
+                                                    hitUploadIds
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+                        ... on UnknownFlags {
+                                message
                         }
                     }
                 }
@@ -702,65 +791,67 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
         assert res == {
             "pullId": self.pull.pullid,
             "compareWithBase": {
-                "impactedFilesDeprecated": [
-                    {
-                        "segments": {
-                            "results": [
-                                {
-                                    "header": "-1,2 +3,4",
-                                    "hasUnintendedChanges": False,
-                                    "lines": [
-                                        {
-                                            "baseNumber": "1",
-                                            "headNumber": "1",
-                                            "baseCoverage": "H",
-                                            "headCoverage": "H",
-                                            "content": "  line1",
-                                            "coverageInfo": {
-                                                "hitCount": 1,
-                                                "hitUploadIds": [0],
+                "impactedFiles": {
+                    "results": [
+                        {
+                            "segments": {
+                                "results": [
+                                    {
+                                        "header": "-1,2 +3,4",
+                                        "hasUnintendedChanges": False,
+                                        "lines": [
+                                            {
+                                                "baseNumber": "1",
+                                                "headNumber": "1",
+                                                "baseCoverage": "H",
+                                                "headCoverage": "H",
+                                                "content": "  line1",
+                                                "coverageInfo": {
+                                                    "hitCount": 1,
+                                                    "hitUploadIds": [0],
+                                                },
                                             },
-                                        },
-                                        {
-                                            "baseNumber": None,
-                                            "headNumber": "2",
-                                            "baseCoverage": None,
-                                            "headCoverage": "H",
-                                            "content": "+  line2",
-                                            "coverageInfo": {
-                                                "hitCount": 1,
-                                                "hitUploadIds": [0],
+                                            {
+                                                "baseNumber": None,
+                                                "headNumber": "2",
+                                                "baseCoverage": None,
+                                                "headCoverage": "H",
+                                                "content": "+  line2",
+                                                "coverageInfo": {
+                                                    "hitCount": 1,
+                                                    "hitUploadIds": [0],
+                                                },
                                             },
-                                        },
-                                    ],
-                                }
-                            ]
-                        }
-                    },
-                    {
-                        "segments": {
-                            "results": [
-                                {
-                                    "header": "-1 +1",
-                                    "hasUnintendedChanges": True,
-                                    "lines": [
-                                        {
-                                            "baseNumber": "1",
-                                            "headNumber": "1",
-                                            "baseCoverage": "M",
-                                            "headCoverage": "H",
-                                            "content": "  line1",
-                                            "coverageInfo": {
-                                                "hitCount": 1,
-                                                "hitUploadIds": [0],
-                                            },
-                                        }
-                                    ],
-                                }
-                            ]
-                        }
-                    },
-                ]
+                                        ],
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "segments": {
+                                "results": [
+                                    {
+                                        "header": "-1 +1",
+                                        "hasUnintendedChanges": True,
+                                        "lines": [
+                                            {
+                                                "baseNumber": "1",
+                                                "headNumber": "1",
+                                                "baseCoverage": "M",
+                                                "headCoverage": "H",
+                                                "content": "  line1",
+                                                "coverageInfo": {
+                                                    "hitCount": 1,
+                                                    "hitUploadIds": [0],
+                                                },
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        },
+                    ]
+                },
             },
         }
 
@@ -819,21 +910,28 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
             pullId
             compareWithBase {
                 ... on Comparison {
-                    impactedFilesDeprecated {
-                        segments {
-                            ... on SegmentComparisons {
-                                results {
-                                    header
-                                    hasUnintendedChanges
-                                    lines {
-                                        baseNumber
-                                        headNumber
-                                        baseCoverage
-                                        headCoverage
-                                        content
+                    impactedFiles(filters: {}){
+                        ... on ImpactedFiles {
+                            results {
+                                segments {
+                                    ... on SegmentComparisons {
+                                        results {
+                                            header
+                                            hasUnintendedChanges
+                                            lines {
+                                                baseNumber
+                                                headNumber
+                                                baseCoverage
+                                                headCoverage
+                                                content
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                        ... on UnknownFlags {
+                                message
                         }
                     }
                 }
@@ -844,27 +942,29 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
         assert res == {
             "pullId": self.pull.pullid,
             "compareWithBase": {
-                "impactedFilesDeprecated": [
-                    {
-                        "segments": {
-                            "results": [
-                                {
-                                    "header": "-1,1 +1,1",
-                                    "hasUnintendedChanges": True,
-                                    "lines": [
-                                        {
-                                            "baseNumber": "1",
-                                            "headNumber": "1",
-                                            "baseCoverage": "M",
-                                            "headCoverage": "H",
-                                            "content": "  line1",
-                                        }
-                                    ],
-                                }
-                            ]
+                "impactedFiles": {
+                    "results": [
+                        {
+                            "segments": {
+                                "results": [
+                                    {
+                                        "header": "-1,1 +1,1",
+                                        "hasUnintendedChanges": True,
+                                        "lines": [
+                                            {
+                                                "baseNumber": "1",
+                                                "headNumber": "1",
+                                                "baseCoverage": "M",
+                                                "headCoverage": "H",
+                                                "content": "  line1",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
                         }
-                    }
-                ]
+                    ]
+                },
             },
         }
 
@@ -889,9 +989,16 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
                     headTotals {
                         percentCovered
                     }
-                    impactedFilesDeprecated {
-                        baseName
-                        headName
+                    impactedFiles(filters: {}) {
+                        ... on ImpactedFiles {
+                            results {
+                                baseName
+                                headName
+                            }
+                        }
+                        ... on UnknownFlags {
+                                message
+                        }
                     }
                 }
             }
@@ -904,7 +1011,7 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
                 "state": "pending",
                 "baseTotals": None,
                 "headTotals": None,
-                "impactedFilesDeprecated": [],
+                "impactedFiles": {"results": []},
             },
         }
 
@@ -923,71 +1030,9 @@ class TestPullComparison(TransactionTestCase, GraphQLTestHelper):
 
         res = self._request(query)
         # it regenerates the comparison as needed
-        assert res["compareWithBase"] != None
+        assert res["compareWithBase"] is not None
 
         compute_comparisons_mock.assert_called_once
-
-    def test_pull_comparison_missing_head_report(self):
-        self.head_report.side_effect = comparison.MissingComparisonReport(
-            "Missing head report"
-        )
-
-        query = """
-            pullId
-            compareWithBase {
-                ... on Comparison {
-                    state
-                    impactedFilesDeprecated {
-                        headName
-                    }
-                }
-            }
-        """
-
-        res = self.gql_request(
-            base_query % (self.repository.name, self.pull.pullid, query),
-            owner=self.owner,
-            with_errors=True,
-        )
-        assert res["errors"] is not None
-        assert res["errors"][0]["message"] == "Missing head report"
-        assert (
-            res["data"]["me"]["owner"]["repository"]["pull"]["compareWithBase"][
-                "impactedFilesDeprecated"
-            ]
-            is None
-        )
-
-    def test_pull_comparison_missing_base_report(self):
-        self.base_report.side_effect = comparison.MissingComparisonReport(
-            "Missing base report"
-        )
-
-        query = """
-            pullId
-            compareWithBase {
-                ... on Comparison {
-                    state
-                    impactedFilesDeprecated {
-                        headName
-                    }
-                }
-            }
-        """
-
-        res = self.gql_request(
-            base_query % (self.repository.name, self.pull.pullid, query),
-            owner=self.owner,
-            with_errors=True,
-        )
-        assert res["errors"] is not None
-        assert res["errors"][0]["message"] == "Missing base report"
-        assert (
-            res["data"]["me"]["owner"]["repository"]["pull"]["compareWithBase"][
-                "impactedFilesDeprecated"
-            ]
-            is None
-        )
 
     def test_pull_comparison_missing_when_commit_comparison_state_is_errored(self):
         self.commit_comparison.state = CommitComparison.CommitComparisonStates.ERROR

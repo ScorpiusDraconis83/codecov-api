@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from unittest.mock import call
 
 import pytest
 from django.http.cookie import SimpleCookie
@@ -8,11 +9,12 @@ from django.urls import reverse
 from django.utils import timezone
 from freezegun import freeze_time
 from shared.config import ConfigHelper
+from shared.django_apps.core.tests.factories import OwnerFactory
+from shared.plan.constants import DEFAULT_FREE_PLAN
 from shared.torngit import Github
 from shared.torngit.exceptions import TorngitClientGeneralError
 
 from codecov_auth.models import Owner
-from codecov_auth.tests.factories import OwnerFactory
 from codecov_auth.views.github import GithubLoginView
 
 
@@ -22,6 +24,7 @@ def _get_state_from_redis(mock_redis):
 
 
 @override_settings(GITHUB_CLIENT_ID="testclientid")
+@pytest.mark.django_db
 def test_get_github_redirect(client, mocker, mock_redis, settings):
     settings.IS_ENTERPRISE = False
 
@@ -36,6 +39,7 @@ def test_get_github_redirect(client, mocker, mock_redis, settings):
 
 
 @override_settings(GITHUB_CLIENT_ID="testclientid")
+@pytest.mark.django_db
 def test_get_github_redirect_host_override(client, mocker, mock_redis, settings):
     settings.IS_ENTERPRISE = False
     config = ConfigHelper()
@@ -52,7 +56,7 @@ def test_get_github_redirect_host_override(client, mocker, mock_redis, settings)
                 return default
         return curr
 
-    mock_get_config = mocker.patch(
+    mocker.patch(
         "shared.torngit.github.get_config",
         side_effect=fake_config,
     )
@@ -67,6 +71,7 @@ def test_get_github_redirect_host_override(client, mocker, mock_redis, settings)
 
 
 @override_settings(GITHUB_CLIENT_ID="testclientid")
+@pytest.mark.django_db
 def test_get_github_redirect_with_ghpr_cookie(client, mocker, mock_redis, settings):
     settings.COOKIES_DOMAIN = ".simple.site"
     settings.COOKIE_SECRET = "secret"
@@ -87,6 +92,7 @@ def test_get_github_redirect_with_ghpr_cookie(client, mocker, mock_redis, settin
 
 
 @override_settings(GITHUB_CLIENT_ID="testclientid")
+@pytest.mark.django_db
 def test_get_github_redirect_with_private_url(client, mocker, mock_redis, settings):
     settings.COOKIES_DOMAIN = ".simple.site"
     settings.COOKIE_SECRET = "secret"
@@ -173,6 +179,10 @@ def test_get_github_already_with_code(client, mocker, db, mock_redis, settings):
         ),
     )
 
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
+
     url = reverse("github-login")
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
@@ -194,7 +204,7 @@ def test_get_github_already_with_code(client, mocker, db, mock_redis, settings):
     assert owner.root_parent_service_id is None
     assert not owner.staff
     assert owner.cache is None
-    assert owner.plan == "users-basic"
+    assert owner.plan == DEFAULT_FREE_PLAN
     assert owner.plan_provider is None
     assert owner.plan_user_count == 1
     assert owner.plan_auto_activate is True
@@ -230,6 +240,9 @@ def test_get_github_already_with_code_github_error(
     async def helper_func(*args, **kwargs):
         raise TorngitClientGeneralError(403, "response", "message")
 
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
 
     mocker.patch.object(Github, "get_authenticated_user", side_effect=helper_func)
@@ -286,6 +299,10 @@ def test_get_github_already_with_code_with_email(
             as_tuple=mocker.MagicMock(return_value=("a", "b"))
         ),
     )
+
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
     url = reverse("github-login")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
@@ -297,10 +314,6 @@ def test_get_github_already_with_code_with_email(
     assert owner.email == "thiago@codecov.io"
     assert owner.private_access is True
     assert res.url == "http://localhost:3000/gh"
-    assert "session_expiry" in res.cookies
-    session_expiry_cookie = res.cookies["session_expiry"]
-    assert session_expiry_cookie.value == "2023-02-01T08:00:00Z"
-    assert session_expiry_cookie.get("domain") == ".simple.site"
 
 
 @freeze_time("2023-01-01T00:00:00")
@@ -340,9 +353,23 @@ def test_get_github_already_with_code_is_student(
             as_tuple=mocker.MagicMock(return_value=("a", "b"))
         ),
     )
+    mock_create_user_onboarding_metric = mocker.patch(
+        "shared.django_apps.codecov_metrics.service.codecov_metrics.UserOnboardingMetricsService.create_user_onboarding_metric"
+    )
+
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
     url = reverse("github-login")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
+    expected_call = call(
+        org_id=client.session["current_owner_id"],
+        event="INSTALLED_APP",
+        payload={"login": "github"},
+    )
+    assert mock_create_user_onboarding_metric.call_args_list == [expected_call]
+
     assert res.status_code == 302
 
     owner = Owner.objects.get(pk=client.session["current_owner_id"])
@@ -352,10 +379,6 @@ def test_get_github_already_with_code_is_student(
     assert owner.private_access is True
     assert res.url == "http://localhost:3000/gh"
     assert owner.student is True
-    assert "session_expiry" in res.cookies
-    session_expiry_cookie = res.cookies["session_expiry"]
-    assert session_expiry_cookie.value == "2023-01-01T08:00:00Z"
-    assert session_expiry_cookie.get("domain") == ".simple.site"
 
 
 @freeze_time("2023-01-01T00:00:00")
@@ -401,6 +424,11 @@ def test_get_github_already_owner_already_exist(
             as_tuple=mocker.MagicMock(return_value=("a", "b"))
         ),
     )
+
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
+
     url = reverse("github-login")
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
@@ -413,10 +441,6 @@ def test_get_github_already_owner_already_exist(
     assert owner.service_id == "44376991"
     assert owner.private_access is True
     assert res.url == "http://localhost:3000/gh"
-    assert "session_expiry" in res.cookies
-    session_expiry_cookie = res.cookies["session_expiry"]
-    assert session_expiry_cookie.value == "2023-01-01T08:00:00Z"
-    assert session_expiry_cookie.get("domain") == ".simple.site"
 
 
 @pytest.mark.asyncio
@@ -472,6 +496,9 @@ def test_get_github_missing_access_token(client, mocker, db, mock_redis, setting
 
     mocker.patch.object(Github, "get_authenticated_user", side_effect=helper_func)
     mock_redis.setex("oauth-state-abc", 300, "http://localhost:3000/gh")
+    session = client.session
+    session["github_oauth_state"] = "abc"
+    session.save()
     url = reverse("github-login")
     res = client.get(url, {"code": "aaaaaaa", "state": "abc"})
     assert res.status_code == 302

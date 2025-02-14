@@ -1,6 +1,4 @@
 import hashlib
-import math
-from fractions import Fraction
 
 from ariadne import ObjectType
 from shared.utils.merge import LineType, line_type
@@ -29,7 +27,7 @@ def get_coverage_type(line_report):
 
 
 @file_bindable.field("coverage")
-def resolve_content(data, info):
+def resolve_coverage(data, info):
     file_report = data.get("file_report")
 
     if not file_report:
@@ -42,7 +40,7 @@ def resolve_content(data, info):
 
 
 @file_bindable.field("totals")
-def resolve_content(data, info):
+def resolve_totals(data, info):
     file_report = data.get("file_report")
     return file_report.totals if file_report else None
 

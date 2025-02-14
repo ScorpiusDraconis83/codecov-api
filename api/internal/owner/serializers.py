@@ -1,20 +1,17 @@
 import logging
-from dataclasses import asdict
 from datetime import datetime
+from typing import Any, Dict
 
 from dateutil.relativedelta import relativedelta
-from django.conf import settings
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
-
-from codecov_auth.models import Owner
-from plan.constants import (
-    PAID_PLANS,
-    SENTRY_PAID_USER_PLAN_REPRESENTATIONS,
+from shared.plan.constants import (
     TEAM_PLAN_MAX_USERS,
-    TEAM_PLAN_REPRESENTATIONS,
+    TierName,
 )
-from plan.service import PlanService
+from shared.plan.service import PlanService
+
+from codecov_auth.models import Owner, Plan
 from services.billing import BillingService
 from services.sentry import send_user_webhook as send_sentry_webhook
 
@@ -38,7 +35,7 @@ class OwnerSerializer(serializers.ModelSerializer):
 
         read_only_fields = fields
 
-    def get_stats(self, obj):
+    def get_stats(self, obj: Owner) -> str | None:
         if obj.cache and "stats" in obj.cache:
             return obj.cache["stats"]
 
@@ -51,7 +48,7 @@ class StripeLineItemSerializer(serializers.Serializer):
     plan_name = serializers.SerializerMethodField()
     quantity = serializers.IntegerField()
 
-    def get_plan_name(self, line_item):
+    def get_plan_name(self, line_item: Dict[str, str]) -> str | None:
         plan = line_item.get("plan")
         if plan:
             return plan.get("name")
@@ -86,7 +83,7 @@ class StripeDiscountSerializer(serializers.Serializer):
     duration_in_months = serializers.IntegerField(source="coupon.duration_in_months")
     expires = serializers.SerializerMethodField()
 
-    def get_expires(self, customer):
+    def get_expires(self, customer: Dict[str, Dict]) -> int | None:
         coupon = customer.get("coupon")
         if coupon:
             months = coupon.get("duration_in_months")
@@ -99,6 +96,7 @@ class StripeDiscountSerializer(serializers.Serializer):
 class StripeCustomerSerializer(serializers.Serializer):
     id = serializers.CharField()
     discount = StripeDiscountSerializer()
+    email = serializers.CharField()
 
 
 class StripeCardSerializer(serializers.Serializer):
@@ -108,8 +106,14 @@ class StripeCardSerializer(serializers.Serializer):
     last4 = serializers.CharField()
 
 
+class StripeUSBankAccountSerializer(serializers.Serializer):
+    bank_name = serializers.CharField()
+    last4 = serializers.CharField()
+
+
 class StripePaymentMethodSerializer(serializers.Serializer):
     card = StripeCardSerializer(read_only=True)
+    us_bank_account = StripeUSBankAccountSerializer(read_only=True)
     billing_details = serializers.JSONField(read_only=True)
 
 
@@ -121,57 +125,67 @@ class PlanSerializer(serializers.Serializer):
     benefits = serializers.JSONField(read_only=True)
     quantity = serializers.IntegerField(required=False)
 
-    def validate_value(self, value):
+    def validate_value(self, value: str) -> str:
         current_org = self.context["view"].owner
         current_owner = self.context["request"].current_owner
 
         plan_service = PlanService(current_org=current_org)
-        available_plans = [
-            asdict(plan) for plan in plan_service.available_plans(current_owner)
+        plan_values = [
+            plan.name for plan in plan_service.available_plans(current_owner)
         ]
-        plan_values = [plan["value"] for plan in available_plans]
         if value not in plan_values:
-            if value in SENTRY_PAID_USER_PLAN_REPRESENTATIONS:
-                log.warning(
-                    f"Non-Sentry user attempted to transition to Sentry plan",
-                    extra=dict(owner_id=current_owner.pk, plan=value),
-                )
             raise serializers.ValidationError(
-                f"Invalid value for plan: {value}; " f"must be one of {plan_values}"
+                f"Invalid value for plan: {value}; must be one of {plan_values}"
             )
         return value
 
-    def validate(self, plan):
-        owner = self.context["view"].owner
+    def validate(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        current_org = self.context["view"].owner
+        if current_org.account:
+            raise serializers.ValidationError(
+                detail="You cannot update your plan manually, for help or changes to plan, connect with sales@codecov.io"
+            )
+
+        active_plans = Plan.objects.select_related("tier").filter(
+            paid_plan=True, is_active=True
+        )
+
+        active_plan_names = set(active_plans.values_list("name", flat=True))
+        team_tier_plans = active_plans.filter(
+            tier__tier_name=TierName.TEAM.value
+        ).values_list("name", flat=True)
 
         # Validate quantity here because we need access to whole plan object
-        if plan["value"] in PAID_PLANS:
+        if plan["value"] in active_plan_names:
             if "quantity" not in plan:
                 raise serializers.ValidationError(
-                    f"Field 'quantity' required for updating to paid plans"
+                    "Field 'quantity' required for updating to paid plans"
                 )
             if plan["quantity"] <= 1:
                 raise serializers.ValidationError(
-                    f"Quantity for paid plan must be greater than 1"
+                    "Quantity for paid plan must be greater than 1"
                 )
 
-            plan_service = PlanService(current_org=owner)
+            plan_service = PlanService(current_org=current_org)
             is_org_trialing = plan_service.is_org_trialing
 
-            if plan["quantity"] < owner.activated_user_count and not is_org_trialing:
-                raise serializers.ValidationError(
-                    f"Quantity cannot be lower than currently activated user count"
-                )
             if (
-                plan["quantity"] == owner.plan_user_count
-                and plan["value"] == owner.plan
+                plan["quantity"] < current_org.activated_user_count
                 and not is_org_trialing
             ):
                 raise serializers.ValidationError(
-                    f"Quantity or plan for paid plan must be different from the existing one"
+                    "Quantity cannot be lower than currently activated user count"
                 )
             if (
-                plan["value"] in TEAM_PLAN_REPRESENTATIONS
+                plan["quantity"] == current_org.plan_user_count
+                and plan["value"] == current_org.plan
+                and not is_org_trialing
+            ):
+                raise serializers.ValidationError(
+                    "Quantity or plan for paid plan must be different from the existing one"
+                )
+            if (
+                plan["value"] in team_tier_plans
                 and plan["quantity"] > TEAM_PLAN_MAX_USERS
             ):
                 raise serializers.ValidationError(
@@ -189,6 +203,9 @@ class SubscriptionDetailSerializer(serializers.Serializer):
     current_period_end = serializers.IntegerField()
     customer = StripeCustomerSerializer()
     collection_method = serializers.CharField()
+    tax_ids = serializers.ListField(
+        source="customer.tax_ids.data", read_only=True, allow_null=True
+    )
     trial_end = serializers.IntegerField()
 
 
@@ -197,34 +214,33 @@ class StripeScheduledPhaseSerializer(serializers.Serializer):
     plan = serializers.SerializerMethodField()
     quantity = serializers.SerializerMethodField()
 
-    def get_plan(self, phase):
-        plan_id = phase["plans"][0]["plan"]
-        stripe_plan_dict = settings.STRIPE_PLAN_IDS
-        plan_name = list(stripe_plan_dict.keys())[
-            list(stripe_plan_dict.values()).index(plan_id)
-        ]
-        marketing_plan_name = PAID_PLANS[plan_name].billing_rate
+    def get_plan(self, phase: Dict[str, Any]) -> str:
+        plan_id = phase["items"][0]["plan"]
+        marketing_plan_name = Plan.objects.get(stripe_id=plan_id).marketing_name
         return marketing_plan_name
 
-    def get_quantity(self, phase):
-        return phase["plans"][0]["quantity"]
+    def get_quantity(self, phase: Dict[str, Any]) -> int:
+        return phase["items"][0]["quantity"]
 
 
 class ScheduleDetailSerializer(serializers.Serializer):
     id = serializers.CharField()
     scheduled_phase = serializers.SerializerMethodField()
 
-    def get_scheduled_phase(self, schedule):
+    def get_scheduled_phase(self, schedule: Dict[str, Any]) -> Dict[str, Any] | None:
         if len(schedule["phases"]) > 1:
             return StripeScheduledPhaseSerializer(schedule["phases"][-1]).data
         else:
             # This error represents the phases object not having 2 phases; we are interested in the 2nd entry within phases
-            # since it represents the scheduled phase
+            # since it represents the scheduled phase.
+            # It should not be possible for a schedule to have one phase, but we have seen certain cases where this is true
+            # after manual intervention on a subscription.
             log.error(
                 "Expecting schedule object to have 2 phases, returning None",
                 extra=dict(
-                    ownerid=schedule.metadata.obo_organization,
-                    requesting_user_id=schedule.metadata.obo,
+                    ownerid=schedule.metadata.get("obo_organization"),
+                    requesting_user_id=schedule.metadata.get("obo"),
+                    phases=schedule.get("phases", "no phases"),
                 ),
             )
             return None
@@ -248,6 +264,10 @@ class AccountDetailsSerializer(serializers.ModelSerializer):
     root_organization = RootOrganizationSerializer()
     schedule_detail = serializers.SerializerMethodField()
     apply_cancellation_discount = serializers.BooleanField(write_only=True)
+    activated_student_count = serializers.SerializerMethodField()
+    activated_user_count = serializers.SerializerMethodField()
+    delinquent = serializers.SerializerMethodField()
+    uses_invoice = serializers.SerializerMethodField()
 
     class Meta:
         model = Owner
@@ -257,48 +277,75 @@ class AccountDetailsSerializer(serializers.ModelSerializer):
         fields = read_only_fields + (
             "activated_student_count",
             "activated_user_count",
+            "apply_cancellation_discount",
             "checkout_session_id",
+            "delinquent",
             "email",
             "inactive_user_count",
             "name",
             "nb_active_private_repos",
-            "plan",
             "plan_auto_activate",
             "plan_provider",
-            "uses_invoice",
+            "plan",
             "repo_total_credits",
             "root_organization",
             "schedule_detail",
             "student_count",
             "subscription_detail",
-            "apply_cancellation_discount",
+            "uses_invoice",
         )
 
-    def _get_billing(self):
+    def _get_billing(self) -> BillingService:
         current_owner = self.context["request"].current_owner
         return BillingService(requesting_user=current_owner)
 
-    def get_subscription_detail(self, owner):
+    def get_subscription_detail(self, owner: Owner) -> Dict[str, Any] | None:
         subscription_detail = self._get_billing().get_subscription(owner)
         if subscription_detail:
             return SubscriptionDetailSerializer(subscription_detail).data
 
-    def get_schedule_detail(self, owner):
+    def get_schedule_detail(self, owner: Owner) -> Dict[str, Any] | None:
         schedule_detail = self._get_billing().get_schedule(owner)
         if schedule_detail:
             return ScheduleDetailSerializer(schedule_detail).data
 
-    def get_checkout_session_id(self, _):
+    def get_checkout_session_id(self, _: Any) -> str:
         return self.context.get("checkout_session_id")
 
-    def update(self, instance, validated_data):
+    def get_activated_student_count(self, owner: Owner) -> int:
+        if owner.account:
+            return owner.account.activated_student_count
+        return owner.activated_student_count
+
+    def get_activated_user_count(self, owner: Owner) -> int:
+        if owner.account:
+            return owner.account.activated_user_count
+        return owner.activated_user_count
+
+    def get_delinquent(self, owner: Owner) -> bool:
+        if owner.account:
+            return owner.account.is_delinquent
+        return owner.delinquent
+
+    def get_uses_invoice(self, owner: Owner) -> bool:
+        if owner.account:
+            return owner.account.invoice_billing.filter(is_active=True).exists()
+        return owner.uses_invoice
+
+    def update(self, instance: Owner, validated_data: Dict[str, Any]) -> object:
         if "pretty_plan" in validated_data:
             desired_plan = validated_data.pop("pretty_plan")
             checkout_session_id_or_none = self._get_billing().update_plan(
                 instance, desired_plan
             )
 
-            if desired_plan["value"] in SENTRY_PAID_USER_PLAN_REPRESENTATIONS:
+            plan = (
+                Plan.objects.select_related("tier")
+                .filter(name=desired_plan["value"])
+                .first()
+            )
+
+            if plan and plan.tier.tier_name == TierName.SENTRY.value:
                 current_owner = self.context["view"].request.current_owner
                 send_sentry_webhook(current_owner, instance)
 
@@ -330,7 +377,7 @@ class UserSerializer(serializers.ModelSerializer):
             "last_pull_timestamp",
         )
 
-    def update(self, instance, validated_data):
+    def update(self, instance: Owner, validated_data: Dict[str, Any]) -> object:
         owner = self.context["view"].owner
 
         if "activated" in validated_data:
@@ -354,7 +401,7 @@ class UserSerializer(serializers.ModelSerializer):
         # Re-fetch from DB to set activated and admin fields
         return self.context["view"].get_object()
 
-    def get_last_pull_timestamp(self, obj):
+    def get_last_pull_timestamp(self, obj: Owner) -> str | None:
         # this field comes from an annotation that may not always be applied to the queryset
         if hasattr(obj, "last_pull_timestamp"):
             return obj.last_pull_timestamp

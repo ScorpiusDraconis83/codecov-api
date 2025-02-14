@@ -1,7 +1,8 @@
 import hashlib
 from typing import List, Union
 
-from ariadne import ObjectType, UnionType, convert_kwargs_to_snake_case
+import sentry_sdk
+from ariadne import ObjectType, UnionType
 from shared.reports.types import ReportTotals
 from shared.torngit.exceptions import TorngitClientError
 
@@ -9,11 +10,14 @@ from codecov.db import sync_to_async
 from graphql_api.types.errors import ProviderError, UnknownPath
 from graphql_api.types.errors.errors import UnknownFlags
 from graphql_api.types.segment_comparison.segment_comparison import SegmentComparisons
-from services.comparison import Comparison, MissingComparisonReport, Segment
+from services.comparison import (
+    Comparison,
+    ImpactedFile,
+    MissingComparisonReport,
+)
 from services.profiling import ProfilingSummary
 
 impacted_file_bindable = ObjectType("ImpactedFile")
-from services.comparison import ImpactedFile
 
 
 @impacted_file_bindable.field("fileName")
@@ -60,9 +64,9 @@ def resolve_hashed_path(impacted_file: ImpactedFile, info) -> str:
     return md5_path.hexdigest()
 
 
+@sentry_sdk.trace
 @impacted_file_bindable.field("segments")
 @sync_to_async
-@convert_kwargs_to_snake_case
 def resolve_segments(
     impacted_file: ImpactedFile, info, filters=None
 ) -> Union[UnknownPath, ProviderError, SegmentComparisons]:
@@ -94,8 +98,12 @@ def resolve_segments(
         # segments with no diff changes and at least 1 unintended change
         segments = [segment for segment in segments if segment.has_unintended_changes]
     elif filters.get("has_unintended_changes") is False:
-        # segments with at least 1 diff change
-        segments = [segment for segment in segments if segment.has_diff_changes]
+        new_segments = []
+        for segment in segments:
+            if segment.has_diff_changes:
+                segment.remove_unintended_changes()
+                new_segments.append(segment)
+        segments = new_segments
 
     return SegmentComparisons(results=segments)
 
@@ -126,6 +134,7 @@ def resolve_misses_count(impacted_file: ImpactedFile, info) -> int:
     return impacted_file.misses_count
 
 
+@sentry_sdk.trace
 @impacted_file_bindable.field("isCriticalFile")
 @sync_to_async
 def resolve_is_critical_file(impacted_file: ImpactedFile, info) -> bool:

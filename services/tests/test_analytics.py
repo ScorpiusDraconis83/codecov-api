@@ -1,14 +1,14 @@
 from datetime import datetime, timedelta
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 import pytest
 from django.test import TestCase
 from django.utils import timezone
 from shared.analytics_tracking.events import Events
+from shared.django_apps.codecov_auth.tests.factories import UserFactory
+from shared.django_apps.core.tests.factories import OwnerFactory, RepositoryFactory
 
 from codecov_auth.models import PlanProviders
-from codecov_auth.tests.factories import OwnerFactory, UserFactory
-from core.tests.factories import RepositoryFactory
 from services.analytics import AnalyticsOwner, AnalyticsRepository, AnalyticsService
 
 

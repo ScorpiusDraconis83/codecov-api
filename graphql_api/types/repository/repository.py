@@ -1,28 +1,34 @@
-from datetime import datetime, timedelta
-from typing import Iterable, List, Mapping, Optional
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
+import shared.rate_limits as rate_limits
 import yaml
-from ariadne import ObjectType, UnionType, convert_kwargs_to_snake_case
+from ariadne import ObjectType, UnionType
 from django.conf import settings
-from django.forms.utils import from_current_timezone
+from graphql.type.definition import GraphQLResolveInfo
 
-import timeseries.helpers as timeseries_helpers
 from codecov.db import sync_to_async
-from core.models import Branch, Repository
+from codecov_auth.models import SERVICE_GITHUB, SERVICE_GITHUB_ENTERPRISE, Owner
+from core.models import Branch, Commit, Pull, Repository
 from graphql_api.actions.commits import repo_commits
-from graphql_api.actions.flags import flag_measurements, flags_for_repo
 from graphql_api.dataloader.commit import CommitLoader
 from graphql_api.dataloader.owner import OwnerLoader
 from graphql_api.helpers.connection import (
     queryset_to_connection,
-    queryset_to_connection_sync,
 )
-from graphql_api.helpers.lookahead import lookahead
+from graphql_api.types.coverage_analytics.coverage_analytics import (
+    CoverageAnalyticsProps,
+)
 from graphql_api.types.enums import OrderingDirection
+from graphql_api.types.enums.enum_types import PullRequestState
 from graphql_api.types.errors.errors import NotFoundError, OwnerNotActivatedError
 from services.profiling import CriticalFile, ProfilingSummary
-from timeseries.helpers import fill_sparse_measurements
-from timeseries.models import Dataset, Interval, MeasurementName, MeasurementSummary
+from services.redis_configuration import get_redis_connection
+
+TOKEN_UNAVAILABLE = "Token Unavailable. Please contact your admin."
+
+log = logging.getLogger(__name__)
 
 repository_bindable = ObjectType("Repository")
 
@@ -35,73 +41,75 @@ repository_bindable.set_alias("updatedAt", "updatestamp")
 repository_bindable.set_alias("latestCommitAt", "true_latest_commit_at")
 
 
+@repository_bindable.field("repoid")
+def resolve_repoid(repository: Repository, info: GraphQLResolveInfo) -> int:
+    return repository.repoid
+
+
+@repository_bindable.field("name")
+def resolve_name(repository: Repository, info: GraphQLResolveInfo) -> str:
+    return repository.name
+
+
 @repository_bindable.field("oldestCommitAt")
-def resolve_oldest_commit_at(repository: Repository, info):
+def resolve_oldest_commit_at(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[datetime]:
     if hasattr(repository, "oldest_commit_at"):
         return repository.oldest_commit_at
     else:
         return None
 
 
-@repository_bindable.field("coverage")
-def resolve_coverage(repository: Repository, info):
-    return repository.recent_coverage
-
-
-@repository_bindable.field("coverageSha")
-def resolve_coverage_sha(repository: Repository, info):
-    return repository.coverage_sha
-
-
-@repository_bindable.field("hits")
-def resolve_hits(repository: Repository, info) -> Optional[int]:
-    return repository.hits
-
-
-@repository_bindable.field("misses")
-def resolve_misses(repository: Repository, info) -> Optional[int]:
-    return repository.misses
-
-
-@repository_bindable.field("lines")
-def resolve_lines(repository: Repository, info) -> Optional[int]:
-    return repository.lines
-
-
 @repository_bindable.field("branch")
-def resolve_branch(repository, info, name: str) -> Branch:
+def resolve_branch(
+    repository: Repository, info: GraphQLResolveInfo, name: str
+) -> Branch:
     command = info.context["executor"].get_command("branch")
     return command.fetch_branch(repository, name)
 
 
 @repository_bindable.field("author")
-def resolve_author(repository, info):
+def resolve_author(repository: Repository, info: GraphQLResolveInfo) -> Owner:
     return OwnerLoader.loader(info).load(repository.author_id)
 
 
 @repository_bindable.field("commit")
-def resolve_commit(repository, info, id):
+def resolve_commit(repository: Repository, info: GraphQLResolveInfo, id: int) -> Commit:
     loader = CommitLoader.loader(info, repository.pk)
     return loader.load(id)
 
 
 @repository_bindable.field("uploadToken")
-def resolve_upload_token(repository, info):
+def resolve_upload_token(repository: Repository, info: GraphQLResolveInfo) -> str:
+    should_hide_tokens = settings.HIDE_ALL_CODECOV_TOKENS
+
+    current_owner = info.context["request"].current_owner
+    if not current_owner:
+        is_current_user_admin = False
+    else:
+        is_current_user_admin = current_owner.is_admin(repository.author)
+
+    if should_hide_tokens and not is_current_user_admin:
+        return TOKEN_UNAVAILABLE
     command = info.context["executor"].get_command("repository")
     return command.get_upload_token(repository)
 
 
 @repository_bindable.field("pull")
-def resolve_pull(repository, info, id):
+def resolve_pull(repository: Repository, info: GraphQLResolveInfo, id: int) -> Pull:
     command = info.context["executor"].get_command("pull")
     return command.fetch_pull_request(repository, id)
 
 
 @repository_bindable.field("pulls")
-@convert_kwargs_to_snake_case
 async def resolve_pulls(
-    repository, info, filters=None, ordering_direction=OrderingDirection.DESC, **kwargs
-):
+    repository: Repository,
+    info: GraphQLResolveInfo,
+    filters: Optional[Dict[str, List[PullRequestState]]] = None,
+    ordering_direction: Optional[OrderingDirection] = OrderingDirection.DESC,
+    **kwargs: Any,
+) -> List[Pull]:
     command = info.context["executor"].get_command("pull")
     queryset = await command.fetch_pull_requests(repository, filters)
     return await queryset_to_connection(
@@ -113,8 +121,12 @@ async def resolve_pulls(
 
 
 @repository_bindable.field("commits")
-@convert_kwargs_to_snake_case
-async def resolve_commits(repository, info, filters=None, **kwargs):
+async def resolve_commits(
+    repository: Repository,
+    info: GraphQLResolveInfo,
+    filters: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> List[Commit]:
     queryset = await sync_to_async(repo_commits)(repository, filters)
     connection = await queryset_to_connection(
         queryset,
@@ -133,8 +145,12 @@ async def resolve_commits(repository, info, filters=None, **kwargs):
 
 
 @repository_bindable.field("branches")
-@convert_kwargs_to_snake_case
-async def resolve_branches(repository, info, filters=None, **kwargs):
+async def resolve_branches(
+    repository: Repository,
+    info: GraphQLResolveInfo,
+    filters: Optional[Dict[str, str | bool]] = None,
+    **kwargs: Any,
+) -> List[Branch]:
     command = info.context["executor"].get_command("branch")
     queryset = await command.fetch_branches(repository, filters)
     return await queryset_to_connection(
@@ -146,25 +162,29 @@ async def resolve_branches(repository, info, filters=None, **kwargs):
 
 
 @repository_bindable.field("defaultBranch")
-def resolve_default_branch(repository, info):
+def resolve_default_branch(repository: Repository, info: GraphQLResolveInfo) -> str:
     return repository.branch
 
 
 @repository_bindable.field("profilingToken")
-def resolve_profiling_token(repository, info):
+def resolve_profiling_token(repository: Repository, info: GraphQLResolveInfo) -> str:
     command = info.context["executor"].get_command("repository")
     return command.get_repository_token(repository, token_type="profiling")
 
 
 @repository_bindable.field("staticAnalysisToken")
-def resolve_static_analysis_token(repository, info):
+def resolve_static_analysis_token(
+    repository: Repository, info: GraphQLResolveInfo
+) -> str:
     command = info.context["executor"].get_command("repository")
     return command.get_repository_token(repository, token_type="static_analysis")
 
 
 @repository_bindable.field("criticalFiles")
 @sync_to_async
-def resolve_critical_files(repository: Repository, info) -> List[CriticalFile]:
+def resolve_critical_files(
+    repository: Repository, info: GraphQLResolveInfo
+) -> List[CriticalFile]:
     """
     The current critical files for this repository - not tied to any
     particular commit or branch.  Based on the most recently received
@@ -177,12 +197,14 @@ def resolve_critical_files(repository: Repository, info) -> List[CriticalFile]:
 
 
 @repository_bindable.field("graphToken")
-def resolve_graph_token(repository, info):
+def resolve_graph_token(repository: Repository, info: GraphQLResolveInfo) -> str:
     return repository.image_token
 
 
 @repository_bindable.field("yaml")
-def resolve_repo_yaml(repository, info):
+def resolve_repo_yaml(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[str]:
     if repository.yaml is None:
         return None
     return yaml.dump(repository.yaml)
@@ -190,101 +212,19 @@ def resolve_repo_yaml(repository, info):
 
 @repository_bindable.field("bot")
 @sync_to_async
-def resolve_repo_bot(repository, info):
+def resolve_repo_bot(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[Owner]:
     return repository.bot
 
 
-@repository_bindable.field("flags")
-@convert_kwargs_to_snake_case
-@sync_to_async
-def resolve_flags(
-    repository: Repository,
-    info,
-    filters: Mapping = None,
-    ordering_direction: OrderingDirection = OrderingDirection.ASC,
-    **kwargs
-):
-    queryset = flags_for_repo(repository, filters)
-    connection = queryset_to_connection_sync(
-        queryset,
-        ordering=("flag_name",),
-        ordering_direction=ordering_direction,
-        **kwargs,
-    )
-
-    # We fetch the measurements in this resolver since there are multiple child
-    # flag resolvers that depend on this data.  Additionally, we're able to fetch
-    # measurements for all the flags being returned at once.
-    # Use the lookahead to make sure we don't overfetch measurements that we don't
-    # need.
-    node = lookahead(info, ("edges", "node", "measurements"))
-    if node:
-        if settings.TIMESERIES_ENABLED:
-            # TODO: is there a way to have these automatically casted at a
-            # lower level (i.e. based on the schema)?
-            interval = node.args["interval"]
-            if isinstance(interval, str):
-                interval = Interval[interval]
-            after = node.args["after"]
-            if isinstance(after, str):
-                after = from_current_timezone(datetime.fromisoformat(after))
-            before = node.args["before"]
-            if isinstance(before, str):
-                before = from_current_timezone(datetime.fromisoformat(before))
-
-            flag_ids = [edge["node"].pk for edge in connection.edges]
-
-            info.context["flag_measurements"] = flag_measurements(
-                repository, flag_ids, interval, after, before
-            )
-        else:
-            info.context["flag_measurements"] = {}
-
-    return connection
-
-
 @repository_bindable.field("active")
-def resolve_active(repository: Repository, info) -> bool:
+def resolve_active(repository: Repository, info: GraphQLResolveInfo) -> bool:
     return repository.active or False
 
 
-@repository_bindable.field("flagsCount")
-@sync_to_async
-def resolve_flags_count(repository: Repository, info) -> int:
-    return repository.flags.filter(deleted__isnot=True).count()
-
-
-@repository_bindable.field("flagsMeasurementsActive")
-@sync_to_async
-def resolve_flags_measurements_active(repository: Repository, info) -> bool:
-    if not settings.TIMESERIES_ENABLED:
-        return False
-
-    return Dataset.objects.filter(
-        name=MeasurementName.FLAG_COVERAGE.value,
-        repository_id=repository.pk,
-    ).exists()
-
-
-@repository_bindable.field("flagsMeasurementsBackfilled")
-@sync_to_async
-def resolve_flags_measurements_backfilled(repository: Repository, info) -> bool:
-    if not settings.TIMESERIES_ENABLED:
-        return False
-
-    dataset = Dataset.objects.filter(
-        name=MeasurementName.FLAG_COVERAGE.value,
-        repository_id=repository.pk,
-    ).first()
-
-    if not dataset:
-        return False
-
-    return dataset.is_backfilled()
-
-
 @repository_bindable.field("isATSConfigured")
-def resolve_is_ats_configured(repository: Repository, info) -> bool:
+def resolve_is_ats_configured(repository: Repository, info: GraphQLResolveInfo) -> bool:
     if not repository.yaml or "flag_management" not in repository.yaml:
         return False
 
@@ -294,53 +234,114 @@ def resolve_is_ats_configured(repository: Repository, info) -> bool:
     return individual_flags.get("carryforward_mode") == "labels"
 
 
-@repository_bindable.field("measurements")
-@sync_to_async
-def resolve_measurements(
-    repository: Repository,
-    info,
-    interval: Interval,
-    before: Optional[datetime] = None,
-    after: Optional[datetime] = None,
-    branch: Optional[str] = None,
-) -> Iterable[MeasurementSummary]:
-    return fill_sparse_measurements(
-        timeseries_helpers.repository_coverage_measurements_with_fallback(
-            repository,
-            interval,
-            start_date=after,
-            end_date=before,
-            branch=branch,
-        ),
-        interval,
-        start_date=after,
-        end_date=before,
-    )
-
-
 @repository_bindable.field("repositoryConfig")
-def resolve_repository_config(repository: Repository, info):
+def resolve_repository_config(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Repository:
     return repository
 
 
 @repository_bindable.field("primaryLanguage")
-def resolve_language(repository: Repository, info) -> str:
+def resolve_language(repository: Repository, info: GraphQLResolveInfo) -> str:
     return repository.language
 
 
+@repository_bindable.field("languages")
+def resolve_languages(repository: Repository, info: GraphQLResolveInfo) -> List[str]:
+    return repository.languages
+
+
 @repository_bindable.field("bundleAnalysisEnabled")
-def resolve_bundle_analysis_enabled(repository: Repository, info) -> bool:
+def resolve_bundle_analysis_enabled(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[bool]:
     return repository.bundle_analysis_enabled
+
+
+@repository_bindable.field("testAnalyticsEnabled")
+def resolve_test_analytics_enabled(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[bool]:
+    return repository.test_analytics_enabled
+
+
+@repository_bindable.field("coverageEnabled")
+def resolve_coverage_enabled(
+    repository: Repository, info: GraphQLResolveInfo
+) -> Optional[bool]:
+    return repository.coverage_enabled
 
 
 repository_result_bindable = UnionType("RepositoryResult")
 
 
 @repository_result_bindable.type_resolver
-def resolve_repository_result_type(obj, *_):
+def resolve_repository_result_type(obj: Any, *_: Any) -> Optional[str]:
     if isinstance(obj, Repository):
         return "Repository"
     elif isinstance(obj, OwnerNotActivatedError):
         return "OwnerNotActivatedError"
     elif isinstance(obj, NotFoundError):
         return "NotFoundError"
+
+
+@repository_bindable.field("isFirstPullRequest")
+@sync_to_async
+def resolve_is_first_pull_request(
+    repository: Repository, info: GraphQLResolveInfo
+) -> bool:
+    has_one_pr = repository.pull_requests.count() == 1
+
+    if has_one_pr:
+        first_pr = repository.pull_requests.first()
+        return not first_pr.compared_to
+
+    return False
+
+
+@repository_bindable.field("isGithubRateLimited")
+@sync_to_async
+def resolve_is_github_rate_limited(
+    repository: Repository, info: GraphQLResolveInfo
+) -> bool | None:
+    if (
+        repository.service != SERVICE_GITHUB
+        and repository.service != SERVICE_GITHUB_ENTERPRISE
+    ):
+        return False
+    repo_owner = repository.author
+    try:
+        redis_connection = get_redis_connection()
+        rate_limit_redis_key = rate_limits.determine_entity_redis_key(
+            owner=repo_owner, repository=repository
+        )
+        return rate_limits.determine_if_entity_is_rate_limited(
+            redis_connection, rate_limit_redis_key
+        )
+    except Exception:
+        log.warning(
+            "Error when checking rate limit",
+            extra=dict(repo_id=repository.repoid, has_owner=bool(repo_owner)),
+        )
+        return None
+
+
+@repository_bindable.field("coverageAnalytics")
+def resolve_coverage_analytics(
+    repository: Repository,
+    info: GraphQLResolveInfo,
+) -> CoverageAnalyticsProps:
+    return CoverageAnalyticsProps(
+        repository=repository,
+    )
+
+
+@repository_bindable.field("testAnalytics")
+def resolve_test_analytics(
+    repository: Repository,
+    info: GraphQLResolveInfo,
+) -> Repository:
+    """
+    resolve_test_analytics defines the data that will get passed to the testAnalytics resolvers
+    """
+    return repository

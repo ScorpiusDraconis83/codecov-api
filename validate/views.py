@@ -1,30 +1,37 @@
 import logging
 from json import dumps
+from typing import Any
 
 from django.conf import settings
-from django.http import HttpResponse
+from django.http import HttpRequest, HttpResponse
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from shared.metrics import Counter, inc_counter
 from shared.validation.exceptions import InvalidYamlException
 from shared.yaml.validation import validate_yaml
 from yaml import YAMLError, safe_load
 
 log = logging.getLogger(__name__)
 
+API_VALIDATE_V2_COUNTER = Counter(
+    "api_validate_v2",
+    "Number of times the validate v2 endpoint has been hit",
+)
+
 
 class V1ValidateYamlHandler(APIView):
     permission_classes = [AllowAny]
 
-    def get(self, request, *args, **kwargs):
+    def get(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
         return HttpResponse(
             f"Usage:\n\ncurl -X POST --data-binary @codecov.yml {settings.CODECOV_URL}/validate\n",
             status=status.HTTP_200_OK,
             content_type="text/plain",
         )
 
-    def post(self, request, *args, **kwargs):
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
         if not self.request.body:
             return HttpResponse(
                 "No content posted.",
@@ -38,7 +45,7 @@ class V1ValidateYamlHandler(APIView):
 
             if not isinstance(yaml_dict, dict):
                 log.warning(
-                    f"yaml_dict result from loading validate request body is not a dict",
+                    "yaml_dict result from loading validate request body is not a dict",
                     extra=dict(
                         yaml_dict=yaml_dict, request_body=str(self.request.body)
                     ),
@@ -49,7 +56,7 @@ class V1ValidateYamlHandler(APIView):
                     content_type="text/plain",
                 )
 
-        except YAMLError as e:
+        except YAMLError:
             return HttpResponse(
                 "Can't parse YAML\n",
                 status=status.HTTP_400_BAD_REQUEST,
@@ -76,7 +83,13 @@ class V1ValidateYamlHandler(APIView):
 class V2ValidateYamlHandler(V1ValidateYamlHandler):
     permission_classes = [AllowAny]
 
-    def post(self, request, *args, **kwargs):
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        source = self.request.query_params.get("source", "unknown")
+        inc_counter(
+            API_VALIDATE_V2_COUNTER,
+            labels=dict(source=source),
+        )
+
         if not self.request.body:
             return Response(
                 {
@@ -91,7 +104,7 @@ class V2ValidateYamlHandler(V1ValidateYamlHandler):
             yaml_dict = safe_load(self.request.body)
             if not isinstance(yaml_dict, dict):
                 log.warning(
-                    f"yaml_dict result from loading validate request body is not a dict",
+                    "yaml_dict result from loading validate request body is not a dict",
                     extra=dict(
                         yaml_dict=yaml_dict, request_body=str(self.request.body)
                     ),

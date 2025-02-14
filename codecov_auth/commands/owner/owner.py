@@ -2,6 +2,7 @@ from codecov.commands.base import BaseCommand
 
 from .interactors.cancel_trial import CancelTrialInteractor
 from .interactors.create_api_token import CreateApiTokenInteractor
+from .interactors.create_stripe_setup_intent import CreateStripeSetupIntentInteractor
 from .interactors.create_user_token import CreateUserTokenInteractor
 from .interactors.delete_session import DeleteSessionInteractor
 from .interactors.fetch_owner import FetchOwnerInteractor
@@ -12,19 +13,26 @@ from .interactors.is_syncing import IsSyncingInteractor
 from .interactors.onboard_user import OnboardUserInteractor
 from .interactors.regenerate_org_upload_token import RegenerateOrgUploadTokenInteractor
 from .interactors.revoke_user_token import RevokeUserTokenInteractor
+from .interactors.save_okta_config import SaveOktaConfigInteractor
 from .interactors.save_terms_agreement import SaveTermsAgreementInteractor
+from .interactors.set_upload_token_required import SetUploadTokenRequiredInteractor
 from .interactors.set_yaml_on_owner import SetYamlOnOwnerInteractor
 from .interactors.start_trial import StartTrialInteractor
+from .interactors.store_codecov_metric import StoreCodecovMetricInteractor
 from .interactors.trigger_sync import TriggerSyncInteractor
 from .interactors.update_default_organization import UpdateDefaultOrganizationInteractor
 from .interactors.update_profile import UpdateProfileInteractor
+from .interactors.update_self_hosted_settings import UpdateSelfHostedSettingsInteractor
 
 
 class OwnerCommands(BaseCommand):
     def create_api_token(self, name):
         return self.get_interactor(CreateApiTokenInteractor).execute(name)
 
-    def delete_session(self, sessionid):
+    def create_stripe_setup_intent(self, owner):
+        return self.get_interactor(CreateStripeSetupIntentInteractor).execute(owner)
+
+    def delete_session(self, sessionid: int):
         return self.get_interactor(DeleteSessionInteractor).execute(sessionid)
 
     def create_user_token(self, name, token_type=None):
@@ -82,3 +90,19 @@ class OwnerCommands(BaseCommand):
         return self.get_interactor(CancelTrialInteractor).execute(
             org_username=org_username
         )
+
+    def update_self_hosted_settings(self, input) -> None:
+        return self.get_interactor(UpdateSelfHostedSettingsInteractor).execute(input)
+
+    def store_codecov_metric(
+        self, org_username: str, event: str, json_string: str
+    ) -> None:
+        return self.get_interactor(StoreCodecovMetricInteractor).execute(
+            org_username, event, json_string
+        )
+
+    def save_okta_config(self, input) -> None:
+        return self.get_interactor(SaveOktaConfigInteractor).execute(input)
+
+    def set_upload_token_required(self, input) -> None:
+        return self.get_interactor(SetUploadTokenRequiredInteractor).execute(input)

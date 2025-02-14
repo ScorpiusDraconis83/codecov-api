@@ -2,12 +2,11 @@ from unittest.mock import patch
 
 import pytest
 from asgiref.sync import async_to_sync
-from django.contrib.auth.models import AnonymousUser
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import OwnerFactory
 
 from codecov.commands.exceptions import Unauthenticated, ValidationError
 from codecov_auth.models import OwnerProfile
-from codecov_auth.tests.factories import OwnerFactory
 
 from ..update_default_organization import UpdateDefaultOrganizationInteractor
 
@@ -48,7 +47,7 @@ class UpdateDefaultOrganizationInteractorTest(TransactionTestCase):
         owner_profile: OwnerProfile = OwnerProfile.objects.filter(
             owner_id=self.owner.ownerid
         ).first()
-        assert owner_profile.default_org == None
+        assert owner_profile.default_org is None
 
     def test_update_owners_default_org(self):
         username = self.execute(

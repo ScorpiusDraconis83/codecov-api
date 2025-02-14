@@ -1,11 +1,9 @@
 import asyncio
 from unittest.mock import patch
 
-import pytest
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import OwnerFactory
 
-from codecov.db import sync_to_async
-from codecov_auth.tests.factories import OwnerFactory
 from graphql_api.tests.helper import GraphQLTestHelper
 
 query = """
@@ -39,4 +37,4 @@ class SetYamlOnOwnerMutationTest(GraphQLTestHelper, TransactionTestCase):
         }
         data = self.gql_request(query, owner=self.owner, variables={"input": input})
         command_mock.assert_called_once_with(input["username"], input["yaml"])
-        data["setYamlOnOwner"]["owner"]["username"] == self.owner.username
+        assert data["setYamlOnOwner"]["owner"]["username"] == self.owner.username

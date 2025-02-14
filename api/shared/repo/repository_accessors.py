@@ -1,14 +1,12 @@
-import asyncio
 import logging
 
+import sentry_sdk
 from asgiref.sync import async_to_sync
 from django.core.exceptions import ObjectDoesNotExist
-from rest_framework.exceptions import APIException, PermissionDenied
-from shared.torngit.exceptions import TorngitClientError
+from django.utils import timezone
 
 from codecov_auth.models import Owner
 from core.models import Repository
-from services.decorators import torngit_safe
 from services.repo_providers import RepoProviderService
 
 log = logging.getLogger(__name__)
@@ -33,6 +31,7 @@ class RepoAccessors:
             RepoProviderService().get_adapter(owner=user, repo=repo).get_authenticated
         )()
 
+    @sentry_sdk.trace
     def get_repo_details(
         self, user, repo_name, repo_owner_username, repo_owner_service
     ):
@@ -72,6 +71,7 @@ class RepoAccessors:
             service=repo_owner_service,
             username=result["owner"]["username"],
             service_id=result["owner"]["service_id"],
+            defaults={"createstamp": timezone.now()},
         )
 
         return Repository.objects.get_or_create_from_git_repo(

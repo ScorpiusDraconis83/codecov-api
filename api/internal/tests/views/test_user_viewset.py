@@ -1,23 +1,28 @@
 from datetime import datetime
 from unittest.mock import patch
 
-import pytest
-from ddf import G
 from rest_framework import status
 from rest_framework.reverse import reverse
-from rest_framework.test import APITransactionTestCase
+from rest_framework.test import APITestCase
+from shared.django_apps.codecov_auth.tests.factories import PlanFactory, TierFactory
+from shared.django_apps.core.tests.factories import (
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
+from shared.plan.constants import DEFAULT_FREE_PLAN, TierName
 
-from codecov_auth.tests.factories import OwnerFactory
 from core.models import Pull
-from core.tests.factories import PullFactory, RepositoryFactory
 from utils.test_utils import APIClient
 
 
-class UserViewSetTests(APITransactionTestCase):
+class UserViewSetTests(APITestCase):
     def setUp(self):
         non_org_active_user = OwnerFactory()
+        tier = TierFactory(tier_name=TierName.BASIC.value)
+        plan = PlanFactory(name=DEFAULT_FREE_PLAN, tier=tier)
         self.current_owner = OwnerFactory(
-            plan="users-free",
+            plan=plan.name,
             plan_user_count=5,
             plan_activated_users=[non_org_active_user.ownerid],
         )
@@ -137,62 +142,82 @@ class UserViewSetTests(APITransactionTestCase):
         ]
 
     def test_list_can_search_by_username(self):
-        # set up some names
-        self.users[0].username = "thanos"
+        # search_fields = ["name", "username", "email"], cannot have any overlaps
+        self.users[0].name = "thor45"  # non_org_active_user
+        self.users[0].username = "thor45"
+        self.users[0].email = "thor45@gmail.com"
         self.users[0].save()
-        self.users[1].username = "thor23"
+        self.users[1].name = "thanos"
+        self.users[1].username = "thanos"
+        self.users[1].email = "huntrobert@gmail.com"
         self.users[1].save()
-        self.users[2].username = "thor"
+        self.users[2].name = "thor23"
+        self.users[2].username = "thor23"
+        self.users[2].email = "thor23@gmail.com"
         self.users[2].save()
+        self.users[3].name = "thor"
+        self.users[3].username = "thor"
+        self.users[3].email = "thor@gmail.com"
+        self.users[3].save()
 
-        response = self._list(query_params={"search": "hor"})
-        assert response.status_code == status.HTTP_200_OK
-        assert response.data["results"] == [
+        expected_response = [
             {
-                "name": self.users[1].name,
+                "name": self.users[3].name,
                 "activated": False,
                 "is_admin": False,
-                "username": "thor23",
-                "email": self.users[1].email,
-                "ownerid": self.users[1].ownerid,
-                "student": self.users[1].student,
+                "username": "thor",
+                "email": self.users[3].email,
+                "ownerid": self.users[3].ownerid,
+                "student": self.users[3].student,
                 "last_pull_timestamp": None,
             },
             {
                 "name": self.users[2].name,
                 "activated": False,
                 "is_admin": False,
-                "username": "thor",
+                "username": "thor23",
                 "email": self.users[2].email,
                 "ownerid": self.users[2].ownerid,
                 "student": self.users[2].student,
                 "last_pull_timestamp": None,
             },
-        ]
-
-    @pytest.mark.skip
-    def test_list_can_search_by_name(self):
-        # set up some names
-        self.users[0].name = "thanos"
-        self.users[0].save()
-        self.users[1].name = "thor23"
-        self.users[1].save()
-        self.users[2].name = "thor"
-        self.users[2].save()
-
-        response = self._list(query_params={"search": "tho"})
-        assert response.status_code == status.HTTP_200_OK
-        expected_result = [
             {
-                "name": "thor23",
-                "activated": False,
+                "name": self.users[0].name,
+                "activated": True,
                 "is_admin": False,
-                "username": self.users[1].username,
-                "email": self.users[1].email,
-                "ownerid": self.users[1].ownerid,
-                "student": self.users[1].student,
+                "username": "thor45",
+                "email": self.users[0].email,
+                "ownerid": self.users[0].ownerid,
+                "student": self.users[0].student,
                 "last_pull_timestamp": None,
             },
+        ]
+
+        response = self._list(query_params={"search": "hor", "ordering": "name"})
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.data["results"]) == len(expected_response)
+        assert response.data["results"] == expected_response
+
+    def test_list_can_search_by_name(self):
+        # search_fields = ["name", "username", "email"], cannot have any overlaps
+        self.users[0].name = "thanos"  # non_org_active_user
+        self.users[0].username = "thanos"
+        self.users[0].email = "huntrobert@gmail.com"
+        self.users[0].save()
+        self.users[1].name = "thor23"
+        self.users[1].username = "thor23"
+        self.users[1].email = "thor23@gmail.com"
+        self.users[1].save()
+        self.users[2].name = "thor"
+        self.users[2].username = "thor"
+        self.users[2].email = "thor@gmail.com"
+        self.users[2].save()
+        self.users[3].name = "loki"
+        self.users[3].username = "loki"
+        self.users[3].email = "loki@gmail.com"
+        self.users[3].save()
+
+        expected_result = [
             {
                 "name": "thor",
                 "activated": False,
@@ -203,27 +228,46 @@ class UserViewSetTests(APITransactionTestCase):
                 "student": self.users[2].student,
                 "last_pull_timestamp": None,
             },
+            {
+                "name": "thor23",
+                "activated": False,
+                "is_admin": False,
+                "username": self.users[1].username,
+                "email": self.users[1].email,
+                "ownerid": self.users[1].ownerid,
+                "student": self.users[1].student,
+                "last_pull_timestamp": None,
+            },
         ]
-        assert response.data["results"][0] == expected_result[0]
-        assert response.data["results"][1] == expected_result[1]
+
+        response = self._list(query_params={"search": "tho", "ordering": "name"})
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.data["results"]) == len(expected_result)
         assert response.data["results"] == expected_result
 
-    @pytest.mark.skip(reason="flaky, skipping until re write")
     def test_list_can_search_by_email(self):
-        # set up some names
+        # search_fields = ["name", "username", "email"], cannot have any overlaps
+        self.users[0].name = "thanos"  # non_org_active_user
+        self.users[0].username = "thanos"
         self.users[0].email = "thanos@gmail.com"
         self.users[0].save()
+        self.users[1].name = "ironman"
+        self.users[1].username = "ironman"
         self.users[1].email = "ironman@gmail.com"
         self.users[1].save()
+        self.users[2].name = "thor"
+        self.users[2].username = "thor"
         self.users[2].email = "thor@gmail.com"
         self.users[2].save()
+        self.users[3].name = "loki"
+        self.users[3].username = "loki"
+        self.users[3].email = "loki@gmail.com"
+        self.users[3].save()
 
-        response = self._list(query_params={"search": "th"})
-        assert response.status_code == status.HTTP_200_OK
-        assert response.data["results"] == [
+        expected_response = [
             {
                 "name": self.users[0].name,
-                "activated": False,
+                "activated": True,
                 "is_admin": False,
                 "username": self.users[0].username,
                 "email": "thanos@gmail.com",
@@ -242,6 +286,11 @@ class UserViewSetTests(APITransactionTestCase):
                 "last_pull_timestamp": None,
             },
         ]
+
+        response = self._list(query_params={"search": "th", "ordering": "name"})
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.data["results"]) == len(expected_response)
+        assert response.data["results"] == expected_response
 
     def test_list_can_order_by_name(self):
         self.users[0].name = "a"

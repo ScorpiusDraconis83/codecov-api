@@ -1,12 +1,22 @@
+import os
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from django.test import TransactionTestCase
 from freezegun import freeze_time
+from shared.api_archive.archive import ArchiveService
+from shared.bundle_analysis import StoragePaths
+from shared.bundle_analysis.storage import get_bucket_name
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
+from shared.storage.memory import MemoryStorageService
 
-from codecov_auth.tests.factories import OwnerFactory
 from compare.tests.factories import CommitComparisonFactory
 from core.models import Commit
-from core.tests.factories import CommitFactory, PullFactory, RepositoryFactory
 from reports.models import CommitReport
 from reports.tests.factories import CommitReportFactory, ReportLevelTotalsFactory
 
@@ -42,8 +52,10 @@ default_pull_request_detail_query = """
         username
     }
     head {
-        totals {
-            coverage
+        coverageAnalytics {
+            totals {
+                coverage
+            }
         }
     }
     comparedTo {
@@ -70,8 +82,10 @@ pull_request_detail_query_with_bundle_analysis = """
         username
     }
     head {
-        totals {
-            coverage
+        coverageAnalytics {
+            totals {
+                coverage
+            }
         }
     }
     comparedTo {
@@ -88,7 +102,11 @@ pull_request_detail_query_with_bundle_analysis = """
     bundleAnalysisCompareWithBase {
         __typename
         ... on BundleAnalysisComparison {
-            sizeDelta
+            bundleData {
+                size {
+                    uncompress
+                }
+            }
         }
     }
     behindBy
@@ -99,7 +117,11 @@ pull_request_bundle_analysis_missing_reports = """
     bundleAnalysisCompareWithBase {
         __typename
         ... on BundleAnalysisComparison {
-            sizeDelta
+            bundleData {
+                size {
+                    uncompress
+                }
+            }
         }
     }
 """
@@ -146,8 +168,9 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
         assert pull_1.title in pull_titles
         assert pull_2.title in pull_titles
 
-    @freeze_time("2021-02-02")
-    def test_when_repository_has_null_compared_to(self):
+    @freeze_time("2021-02-02 00:00:00")
+    @patch("core.commands.pull.interactors.fetch_pull_request.TaskService")
+    def test_when_repository_has_null_compared_to(self, mock_task_service):
         my_pull = PullFactory(
             repository=self.repository,
             title="test-null-base",
@@ -159,16 +182,17 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             ).commitid,
             compared_to=None,
         )
-        pull = self.fetch_one_pull_request(
-            my_pull.pullid, pull_request_detail_query_with_bundle_analysis
-        )
+        with freeze_time("2021-02-02 06:00:00"):
+            pull = self.fetch_one_pull_request(
+                my_pull.pullid, pull_request_detail_query_with_bundle_analysis
+            )
         assert pull == {
             "title": "test-null-base",
             "state": "OPEN",
             "pullId": my_pull.pullid,
             "updatestamp": "2021-02-02T00:00:00",
             "author": {"username": "test-pull-user"},
-            "head": {"totals": None},
+            "head": {"coverageAnalytics": {"totals": None}},
             "comparedTo": None,
             "compareWithBase": {
                 "__typename": "MissingBaseCommit",
@@ -179,9 +203,13 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             "behindBy": None,
             "behindByCommit": None,
         }
+        mock_task_service.return_value.pulls_sync.assert_called_with(
+            my_pull.repository.repoid, my_pull.pullid
+        )
 
-    @freeze_time("2021-02-02")
-    def test_when_repository_has_null_author(self):
+    @freeze_time("2021-02-02 00:00:00")
+    @patch("core.commands.pull.interactors.fetch_pull_request.TaskService")
+    def test_when_repository_has_null_author(self, mock_task_service):
         PullFactory(
             repository=self.repository,
             title="dummy-first-pr",
@@ -213,9 +241,11 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             "behindBy": None,
             "behindByCommit": None,
         }
+        mock_task_service.return_value.pulls_sync.assert_not_called()
 
     @freeze_time("2021-02-02")
-    def test_when_repository_has_null_head(self):
+    @patch("core.commands.pull.interactors.fetch_pull_request.TaskService")
+    def test_when_repository_has_null_head_no_parent_report(self, mock_task_service):
         PullFactory(
             repository=self.repository,
             title="dummy-first-pr",
@@ -242,11 +272,83 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
                 "__typename": "MissingHeadCommit",
             },
             "bundleAnalysisCompareWithBase": {
-                "__typename": "MissingHeadCommit",
+                "__typename": "MissingHeadReport",
             },
             "behindBy": None,
             "behindByCommit": None,
         }
+        mock_task_service.return_value.pulls_sync.assert_not_called()
+
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_when_repository_has_null_head_has_parent_report(self, get_storage_service):
+        os.system("rm -rf /tmp/bundle_analysis_*")
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        parent_commit = CommitFactory(repository=self.repository)
+
+        base_commit_report = CommitReportFactory(
+            commit=parent_commit,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+
+        my_pull = PullFactory(
+            repository=self.repository,
+            title="test-pull-request",
+            author=self.owner,
+            head=None,
+            compared_to=base_commit_report.commit.commitid,
+            behind_by=23,
+            behind_by_commit="1089nf898as-jdf09hahs09fgh",
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repository),
+                report_key=base_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            bundleAnalysisCompareWithBase {
+                __typename
+                ... on BundleAnalysisComparison {
+                    bundleData {
+                        size {
+                            uncompress
+                        }
+                    }
+                    bundleChange {
+                        size {
+                            uncompress
+                        }
+                    }
+                }
+            }
+        """
+
+        pull = self.fetch_one_pull_request(my_pull.pullid, query)
+
+        assert pull == {
+            "bundleAnalysisCompareWithBase": {
+                "__typename": "BundleAnalysisComparison",
+                "bundleData": {
+                    "size": {
+                        "uncompress": 165165,
+                    }
+                },
+                "bundleChange": {
+                    "size": {
+                        "uncompress": 0,
+                    }
+                },
+            }
+        }
+
+        for file in os.listdir("/tmp"):
+            assert not file.startswith("bundle_analysis_")
+
+        os.system("rm -rf /tmp/bundle_analysis_*")
 
     @freeze_time("2021-02-02")
     def test_when_pr_is_first_pr_in_repo(self):
@@ -347,7 +449,7 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             "pullId": my_pull.pullid,
             "updatestamp": "2021-02-02T00:00:00",
             "author": {"username": "test-pull-user"},
-            "head": {"totals": {"coverage": 78.38}},
+            "head": {"coverageAnalytics": {"totals": {"coverage": 78.38}}},
             "comparedTo": {"commitid": "9asd78fa7as8d8fa97s8d7fgagsd8fa9asd8f77s"},
             "compareWithBase": {
                 "__typename": "Comparison",
@@ -398,6 +500,82 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             "bundleAnalysisCompareWithBase": {"__typename": "MissingBaseReport"}
         }
 
+    @patch("graphql_api.dataloader.bundle_analysis.get_appropriate_storage_service")
+    def test_bundle_analysis_sqlite_file_deleted(self, get_storage_service):
+        os.system("rm -rf /tmp/bundle_analysis_*")
+        storage = MemoryStorageService({})
+        get_storage_service.return_value = storage
+
+        parent_commit = CommitFactory(repository=self.repository)
+        commit = CommitFactory(
+            repository=self.repository,
+            totals={"c": "12", "diff": [0, 0, 0, 0, 0, "14"]},
+            parent_commit_id=parent_commit.commitid,
+        )
+
+        base_commit_report = CommitReportFactory(
+            commit=parent_commit,
+            report_type=CommitReport.ReportType.BUNDLE_ANALYSIS,
+        )
+        head_commit_report = CommitReportFactory(
+            commit=commit, report_type=CommitReport.ReportType.BUNDLE_ANALYSIS
+        )
+
+        my_pull = PullFactory(
+            repository=self.repository,
+            title="test-pull-request",
+            author=self.owner,
+            head=head_commit_report.commit.commitid,
+            compared_to=base_commit_report.commit.commitid,
+            behind_by=23,
+            behind_by_commit="1089nf898as-jdf09hahs09fgh",
+        )
+
+        with open("./services/tests/samples/base_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repository),
+                report_key=base_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        with open("./services/tests/samples/head_bundle_report.sqlite", "rb") as f:
+            storage_path = StoragePaths.bundle_report.path(
+                repo_key=ArchiveService.get_archive_hash(self.repository),
+                report_key=head_commit_report.external_id,
+            )
+            storage.write_file(get_bucket_name(), storage_path, f)
+
+        query = """
+            bundleAnalysisCompareWithBase {
+                __typename
+                ... on BundleAnalysisComparison {
+                    bundleData {
+                        size {
+                            uncompress
+                        }
+                    }
+                }
+            }
+        """
+
+        pull = self.fetch_one_pull_request(my_pull.pullid, query)
+
+        assert pull == {
+            "bundleAnalysisCompareWithBase": {
+                "__typename": "BundleAnalysisComparison",
+                "bundleData": {
+                    "size": {
+                        "uncompress": 201720,
+                    }
+                },
+            }
+        }
+
+        for file in os.listdir("/tmp"):
+            assert not file.startswith("bundle_analysis_")
+
+        os.system("rm -rf /tmp/bundle_analysis_*")
+
     @freeze_time("2021-02-02")
     def test_pull_no_patch_totals(self):
         head = CommitFactory(
@@ -430,7 +608,7 @@ class TestPullRequestList(GraphQLTestHelper, TransactionTestCase):
             "pullId": my_pull.pullid,
             "updatestamp": "2021-02-02T00:00:00",
             "author": {"username": "test-pull-user"},
-            "head": {"totals": {"coverage": 78.38}},
+            "head": {"coverageAnalytics": {"totals": {"coverage": 78.38}}},
             "comparedTo": {"commitid": "9asd78fa7as8d8fa97s8d7fgagsd8fa9asd8f77s"},
             "compareWithBase": {
                 "__typename": "Comparison",

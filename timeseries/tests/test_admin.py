@@ -6,10 +6,9 @@ from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.test import TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
-
-from codecov_auth.tests.factories import UserFactory
-from core.tests.factories import RepositoryFactory
-from timeseries.tests.factories import DatasetFactory
+from shared.django_apps.codecov_auth.tests.factories import UserFactory
+from shared.django_apps.core.tests.factories import RepositoryFactory
+from shared.django_apps.timeseries.tests.factories import DatasetFactory
 
 
 @pytest.mark.skipif(
@@ -28,7 +27,7 @@ class DatasetAdminTest(TransactionTestCase):
         self.dataset2 = DatasetFactory(repository_id=self.repo2.pk, backfilled=True)
 
     def test_list_page(self):
-        res = self.client.get(reverse(f"admin:timeseries_dataset_changelist"))
+        res = self.client.get(reverse("admin:timeseries_dataset_changelist"))
         assert res.status_code == 200
 
     def test_backfill_page(self):
@@ -64,7 +63,7 @@ class DatasetAdminTest(TransactionTestCase):
         )
         assert res.status_code == 302
 
-        backfill_dataset.call_count == 2
+        assert backfill_dataset.call_count == 2
         backfill_dataset.assert_any_call(
             self.dataset1,
             start_date=timezone.datetime(2000, 1, 1, tzinfo=timezone.utc),

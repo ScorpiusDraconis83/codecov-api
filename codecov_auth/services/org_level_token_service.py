@@ -1,13 +1,11 @@
 import logging
 import uuid
-from secrets import token_bytes
 
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.forms import ValidationError
 
-from codecov_auth.models import OrganizationLevelToken, Owner
-from plan.constants import USER_PLAN_REPRESENTATIONS
+from codecov_auth.models import OrganizationLevelToken, Owner, Plan
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +19,7 @@ class OrgLevelTokenService(object):
 
     @classmethod
     def org_can_have_upload_token(cls, org: Owner):
-        return org.plan in USER_PLAN_REPRESENTATIONS
+        return org.plan in Plan.objects.values_list("name", flat=True)
 
     @classmethod
     def get_or_create_org_token(cls, org: Owner):

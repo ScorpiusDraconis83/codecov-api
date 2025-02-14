@@ -1,11 +1,11 @@
-from distutils.util import execute
 from unittest.mock import patch
 
-import pytest
 from asgiref.sync import async_to_sync
 from django.test import TransactionTestCase, override_settings
-
-from codecov_auth.tests.factories import GetAdminProviderAdapter, OwnerFactory
+from shared.django_apps.codecov_auth.tests.factories import (
+    GetAdminProviderAdapter,
+    OwnerFactory,
+)
 
 from ..get_is_current_user_an_admin import (
     GetIsCurrentUserAnAdminInteractor,

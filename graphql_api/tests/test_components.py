@@ -1,16 +1,24 @@
 from unittest.mock import PropertyMock, patch
 
-from django.test import TransactionTestCase
+import pytest
+from django.conf import settings
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
 from shared.reports.resources import Report, ReportFile, ReportLine
-from shared.reports.types import ReportTotals
 from shared.utils.sessions import Session
 
-from codecov_auth.tests.factories import OwnerFactory
 from compare.models import CommitComparison
 from compare.tests.factories import CommitComparisonFactory, ComponentComparisonFactory
-from core.tests.factories import CommitFactory, PullFactory, RepositoryFactory
 from services.comparison import MissingComparisonReport
 from services.components import Component
+from timeseries.models import MeasurementName
+from timeseries.tests.factories import DatasetFactory, MeasurementFactory
 
 from .helper import GraphQLTestHelper
 
@@ -49,6 +57,40 @@ query_commit_components = """
             repository(name: $repo) {
                 ... on Repository {
                     commit(id: $sha) {
+                        coverageAnalytics {
+                            components {
+                                id
+                                name
+                                totals {
+                                    hitsCount
+                                    missesCount
+                                    percentCovered
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+"""
+
+query_repo = """
+query Repo(
+    $org: String!
+    $repo: String!
+    $sha: String!
+) {
+    owner(username: $org) {
+        repository(name: $repo) {
+            ... on Repository {
+                coverageAnalytics {
+                    componentsMeasurementsActive
+                    componentsMeasurementsBackfilled
+                    componentsCount
+                }
+                commit(id: $sha) {
+                    coverageAnalytics {
                         components {
                             id
                             name
@@ -63,10 +105,39 @@ query_commit_components = """
             }
         }
     }
+}
+"""
+
+query_commit_coverage_components = """
+    query CommitComponents(
+        $org: String!
+        $repo: String!
+        $sha: String!
+    ) {
+        owner(username: $org) {
+            repository(name: $repo) {
+                ... on Repository {
+                    commit(id: $sha) {
+                        coverageAnalytics {
+                            components {
+                                id
+                                name
+                                totals {
+                                    hitsCount
+                                    missesCount
+                                    percentCovered
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 """
 
 
-class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
+class TestCommitCoverageComponents(GraphQLTestHelper, TransactionTestCase):
     def setUp(self):
         self.org = OwnerFactory()
         self.repo = RepositoryFactory(author=self.org, private=False)
@@ -78,12 +149,16 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "repo": self.repo.name,
             "sha": self.commit.commitid,
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(
+            query_commit_coverage_components, variables=variables, owner=OwnerFactory()
+        )
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [],
+                        "coverageAnalytics": {
+                            "components": [],
+                        }
                     }
                 }
             }
@@ -114,31 +189,37 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "repo": self.repo.name,
             "sha": self.commit.commitid,
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(
+            query_commit_coverage_components,
+            variables=variables,
+            owner=OwnerFactory(),
+        )
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [
-                            {
-                                "id": "python",
-                                "name": "python",
-                                "totals": {
-                                    "hitsCount": 1,
-                                    "missesCount": 0,
-                                    "percentCovered": 50.0,
+                        "coverageAnalytics": {
+                            "components": [
+                                {
+                                    "id": "python",
+                                    "name": "python",
+                                    "totals": {
+                                        "hitsCount": 1,
+                                        "missesCount": 0,
+                                        "percentCovered": 50.0,
+                                    },
                                 },
-                            },
-                            {
-                                "id": "golang",
-                                "name": "golang",
-                                "totals": {
-                                    "hitsCount": 5,
-                                    "missesCount": 3,
-                                    "percentCovered": 62.5,
+                                {
+                                    "id": "golang",
+                                    "name": "golang",
+                                    "totals": {
+                                        "hitsCount": 5,
+                                        "missesCount": 3,
+                                        "percentCovered": 62.5,
+                                    },
                                 },
-                            },
-                        ]
+                            ]
+                        }
                     }
                 }
             }
@@ -166,7 +247,7 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
 
         full_report_mock.return_value = sample_report()
 
-        query_commit_components = """
+        query_commit_coverage_components = """
             query CommitComponents(
                 $org: String!
                 $repo: String!
@@ -177,9 +258,11 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
                     repository(name: $repo) {
                         ... on Repository {
                             commit(id: $sha) {
-                                components (filters: $filter) {
-                                    id
-                                    name
+                                coverageAnalytics {
+                                    components (filters: $filter) {
+                                        id
+                                        name
+                                    }
                                 }
                             }
                         }
@@ -195,17 +278,21 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "sha": self.commit.commitid,
             "filter": {"components": ["Python"]},
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(
+            query_commit_coverage_components, variables=variables, owner=OwnerFactory()
+        )
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [
-                            {
-                                "id": "python1.1",
-                                "name": "Python",
-                            },
-                        ]
+                        "coverageAnalytics": {
+                            "components": [
+                                {
+                                    "id": "python1.1",
+                                    "name": "Python",
+                                },
+                            ]
+                        }
                     }
                 }
             }
@@ -218,8 +305,12 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "sha": self.commit.commitid,
             "filter": {"components": ["C++"]},
         }
-        data = self.gql_request(query_commit_components, variables=variables)
-        assert data == {"owner": {"repository": {"commit": {"components": []}}}}
+        data = self.gql_request(query_commit_coverage_components, variables=variables)
+        assert data == {
+            "owner": {
+                "repository": {"commit": {"coverageAnalytics": {"components": []}}}
+            }
+        }
 
         # Find all items
         variables = {
@@ -228,21 +319,23 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "sha": self.commit.commitid,
             "filter": {"components": []},
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(query_commit_coverage_components, variables=variables)
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [
-                            {
-                                "id": "python1.1",
-                                "name": "Python",
-                            },
-                            {
-                                "id": "golang1.2",
-                                "name": "Golang",
-                            },
-                        ]
+                        "coverageAnalytics": {
+                            "components": [
+                                {
+                                    "id": "python1.1",
+                                    "name": "Python",
+                                },
+                                {
+                                    "id": "golang1.2",
+                                    "name": "Golang",
+                                },
+                            ]
+                        }
                     }
                 }
             }
@@ -255,17 +348,21 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "sha": self.commit.commitid,
             "filter": {"components": ["C", "Golang"]},
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(
+            query_commit_coverage_components, variables=variables, owner=OwnerFactory()
+        )
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [
-                            {
-                                "id": "golang1.2",
-                                "name": "Golang",
-                            },
-                        ]
+                        "coverageAnalytics": {
+                            "components": [
+                                {
+                                    "id": "golang1.2",
+                                    "name": "Golang",
+                                },
+                            ]
+                        }
                     }
                 }
             }
@@ -288,7 +385,7 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
 
         full_report_mock.return_value = sample_report()
 
-        query_commit_components = """
+        query_commit_coverage_components = """
             query CommitComponents(
                 $org: String!
                 $repo: String!
@@ -299,9 +396,11 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
                     repository(name: $repo) {
                         ... on Repository {
                             commit(id: $sha) {
-                                components (filters: $filter) {
-                                    id
-                                    name
+                                coverageAnalytics {
+                                    components (filters: $filter) {
+                                        id
+                                        name
+                                    }
                                 }
                             }
                         }
@@ -315,17 +414,21 @@ class TestCommitComponents(GraphQLTestHelper, TransactionTestCase):
             "sha": self.commit.commitid,
             "filter": {"components": ["pYtHoN"]},
         }
-        data = self.gql_request(query_commit_components, variables=variables)
+        data = self.gql_request(
+            query_commit_coverage_components, variables=variables, owner=OwnerFactory()
+        )
         assert data == {
             "owner": {
                 "repository": {
                     "commit": {
-                        "components": [
-                            {
-                                "id": "cpython",
-                                "name": "PyThOn",
-                            },
-                        ]
+                        "coverageAnalytics": {
+                            "components": [
+                                {
+                                    "id": "cpython",
+                                    "name": "PyThOn",
+                                },
+                            ]
+                        }
                     }
                 }
             }
@@ -371,6 +474,8 @@ query_components_comparison = """
 
 
 class TestComponentsComparison(GraphQLTestHelper, TransactionTestCase):
+    databases = {"default", "timeseries"}
+
     def setUp(self):
         self.org = OwnerFactory()
         self.repo = RepositoryFactory(author=self.org, private=False)
@@ -390,6 +495,7 @@ class TestComponentsComparison(GraphQLTestHelper, TransactionTestCase):
             compare_commit=self.head,
             state=CommitComparison.CommitComparisonStates.PROCESSED,
         )
+        self.commit = CommitFactory(repository=self.repo)
 
         # mock reports
         self.head_report_patcher = patch(
@@ -673,6 +779,714 @@ class TestComponentsComparison(GraphQLTestHelper, TransactionTestCase):
                                 },
                             ],
                         }
+                    }
+                }
+            }
+        }
+
+    def test_repository_components_metadata_inactive(self):
+        data = self.gql_request(
+            query_repo,
+            variables={
+                "org": self.org.username,
+                "repo": self.repo.name,
+                "sha": self.commit.commitid,
+            },
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsActive"
+            ]
+            == False
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsBackfilled"
+            ]
+            == False
+        )
+
+    def test_repository_components_metadata_active(self):
+        DatasetFactory(
+            name=MeasurementName.COMPONENT_COVERAGE.value,
+            repository_id=self.repo.pk,
+        )
+
+        data = self.gql_request(
+            query_repo,
+            variables={
+                "org": self.org.username,
+                "repo": self.repo.name,
+                "sha": self.commit.commitid,
+            },
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsActive"
+            ]
+            == True
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsBackfilled"
+            ]
+            == False
+        )
+
+    @patch("timeseries.models.Dataset.is_backfilled")
+    def test_repository_components_metadata_backfilled_true(self, is_backfilled):
+        is_backfilled.return_value = True
+
+        DatasetFactory(
+            name=MeasurementName.COMPONENT_COVERAGE.value,
+            repository_id=self.repo.pk,
+        )
+
+        data = self.gql_request(
+            query_repo,
+            variables={
+                "org": self.org.username,
+                "repo": self.repo.name,
+                "sha": self.commit.commitid,
+            },
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsActive"
+            ]
+            == True
+        )
+        assert (
+            data["owner"]["repository"]["coverageAnalytics"][
+                "componentsMeasurementsBackfilled"
+            ]
+            == True
+        )
+
+
+query_component_measurements = """
+query ComponentMeasurements(
+    $name: String!
+    $repo: String!
+    $interval: MeasurementInterval!
+    $after: DateTime!
+    $before: DateTime!
+    $branch: String
+    $filters: ComponentMeasurementsSetFilters
+    $orderingDirection: OrderingDirection
+) {
+    owner(username: $name) {
+        repository(name: $repo) {
+            ... on Repository {
+                coverageAnalytics {
+                    components(filters: $filters, orderingDirection: $orderingDirection, after: $after, before: $before, branch: $branch, interval: $interval) {
+                        __typename
+                        ... on ComponentMeasurements {
+                            name
+                            percentCovered
+                            percentChange
+                            measurements {
+                                avg
+                                min
+                                max
+                                timestamp
+                            }
+                            lastUploaded
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"""
+
+
+@pytest.mark.skipif(
+    not settings.TIMESERIES_ENABLED, reason="requires timeseries data storage"
+)
+class TestComponentMeasurements(GraphQLTestHelper, TransactionTestCase):
+    databases = {"default", "timeseries"}
+
+    def setUp(self):
+        self.org = OwnerFactory()
+        self.repo = RepositoryFactory(
+            author=self.org,
+            private=False,
+            yaml={
+                "component_management": {
+                    "default_rules": {},
+                    "individual_components": [
+                        {
+                            "component_id": "python",
+                            "name": "pythonName",
+                            "paths": [".*/*.py"],
+                        },
+                        {
+                            "component_id": "golang",
+                            "paths": [".*/*.go"],
+                        },
+                    ],
+                }
+            },
+        )
+        self.commit = CommitFactory(repository=self.repo)
+
+    def test_component_measurements_with_measurements(self):
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=95.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+        }
+        data = self.gql_request(query_component_measurements, variables=variables)
+
+        assert data == {
+            "owner": {
+                "repository": {
+                    "coverageAnalytics": {
+                        "components": [
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "golang",
+                                "percentCovered": 90.0,
+                                "percentChange": 5.0,
+                                "measurements": [
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-20T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 85.0,
+                                        "min": 85.0,
+                                        "max": 85.0,
+                                        "timestamp": "2022-06-21T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 90.0,
+                                        "min": 85.0,
+                                        "max": 95.0,
+                                        "timestamp": "2022-06-22T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-23T00:00:00+00:00",
+                                    },
+                                ],
+                                "lastUploaded": "2022-06-22T01:00:00+00:00",
+                            },
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "pythonName",
+                                "percentCovered": 80.0,
+                                "percentChange": 5.0,
+                                "measurements": [
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-20T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 75.0,
+                                        "min": 75.0,
+                                        "max": 75.0,
+                                        "timestamp": "2022-06-21T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 80.0,
+                                        "min": 75.0,
+                                        "max": 85.0,
+                                        "timestamp": "2022-06-22T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-23T00:00:00+00:00",
+                                    },
+                                ],
+                                "lastUploaded": "2022-06-22T01:00:00+00:00",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+    def test_component_measurements_no_measurements(self):
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+        }
+        data = self.gql_request(query_component_measurements, variables=variables)
+        assert data == {
+            "owner": {
+                "repository": {
+                    "coverageAnalytics": {
+                        "components": [
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "golang",
+                                "percentCovered": None,
+                                "percentChange": None,
+                                "measurements": [],
+                                "lastUploaded": None,
+                            },
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "pythonName",
+                                "percentCovered": None,
+                                "percentChange": None,
+                                "measurements": [],
+                                "lastUploaded": None,
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+    @override_settings(TIMESERIES_ENABLED=False)
+    def test_component_measurements_timeseries_not_enabled(self):
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+        }
+        data = self.gql_request(query_component_measurements, variables=variables)
+        assert data == {
+            "owner": {"repository": {"coverageAnalytics": {"components": []}}}
+        }
+
+    def test_component_measurements_with_filter(self):
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=95.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+            "filters": {"components": ["python"]},
+        }
+        data = self.gql_request(query_component_measurements, variables=variables)
+
+        assert data == {
+            "owner": {
+                "repository": {
+                    "coverageAnalytics": {
+                        "components": [
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "pythonName",
+                                "percentCovered": 80.0,
+                                "percentChange": 5.0,
+                                "measurements": [
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-20T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 75.0,
+                                        "min": 75.0,
+                                        "max": 75.0,
+                                        "timestamp": "2022-06-21T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 80.0,
+                                        "min": 75.0,
+                                        "max": 85.0,
+                                        "timestamp": "2022-06-22T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-23T00:00:00+00:00",
+                                    },
+                                ],
+                                "lastUploaded": "2022-06-22T01:00:00+00:00",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+    def test_component_measurements_with_branch(self):
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=95.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+            "branch": "dev",
+        }
+        data = self.gql_request(query_component_measurements, variables=variables)
+
+        assert data == {
+            "owner": {
+                "repository": {
+                    "coverageAnalytics": {
+                        "components": [
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "golang",
+                                "percentCovered": 90.0,
+                                "percentChange": 5.0,
+                                "measurements": [
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-20T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 85.0,
+                                        "min": 85.0,
+                                        "max": 85.0,
+                                        "timestamp": "2022-06-21T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": 90.0,
+                                        "min": 85.0,
+                                        "max": 95.0,
+                                        "timestamp": "2022-06-22T00:00:00+00:00",
+                                    },
+                                    {
+                                        "avg": None,
+                                        "min": None,
+                                        "max": None,
+                                        "timestamp": "2022-06-23T00:00:00+00:00",
+                                    },
+                                ],
+                                "lastUploaded": "2022-06-22T01:00:00+00:00",
+                            },
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "pythonName",
+                                "percentCovered": None,
+                                "percentChange": None,
+                                "measurements": [],
+                                "lastUploaded": None,
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+    def test_component_measurements_id_fallback(self):
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=75.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="main",
+            measurable_id="python",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-21T00:00:00",
+            value=85.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T00:00:00",
+            value=95.0,
+        )
+        MeasurementFactory(
+            name="component_coverage",
+            owner_id=self.org.pk,
+            repo_id=self.repo.pk,
+            branch="dev",
+            measurable_id="golang",
+            commit_sha=self.commit.pk,
+            timestamp="2022-06-22T01:00:00",
+            value=85.0,
+        )
+
+        query = """
+           query ComponentMeasurements(
+               $name: String!
+               $repo: String!
+               $interval: MeasurementInterval!
+               $after: DateTime!
+               $before: DateTime!
+               $branch: String
+               $filters: ComponentMeasurementsSetFilters
+               $orderingDirection: OrderingDirection
+           ) {
+               owner(username: $name) {
+                   repository: repository(name: $repo) {
+                       ... on Repository {
+                            coverageAnalytics {
+                               components(filters: $filters, orderingDirection: $orderingDirection, after: $after, before: $before, branch: $branch, interval: $interval) {
+                                   __typename
+                                   ... on ComponentMeasurements {
+                                       name
+                                       componentId
+                                   }
+                               }
+                           }
+                       }
+                   }
+               }
+           }
+           """
+
+        variables = {
+            "name": self.org.username,
+            "repo": self.repo.name,
+            "interval": "INTERVAL_1_DAY",
+            "after": timezone.datetime(2022, 6, 20),
+            "before": timezone.datetime(2022, 6, 23),
+            "branch": "dev",
+        }
+        data = self.gql_request(query, variables=variables)
+
+        assert data == {
+            "owner": {
+                "repository": {
+                    "coverageAnalytics": {
+                        "components": [
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "golang",
+                                "componentId": "golang",
+                            },
+                            {
+                                "__typename": "ComponentMeasurements",
+                                "name": "pythonName",
+                                "componentId": "python",
+                            },
+                        ]
                     }
                 }
             }

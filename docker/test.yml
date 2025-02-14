@@ -3,6 +3,8 @@ setup:
   debug: no
   loglvl: INFO
   encryption_secret: "zp^P9*i8aR3"
+  okta:
+    iss: "https://example.okta.com"
   http:
     force_https: yes
     cookie_secret: abc123
@@ -25,10 +27,9 @@ setup:
 services:
   database_url: postgres://postgres:password@postgres:5432/postgres
   timeseries_database_url: postgres://postgres:password@timescale:5432/postgres
-  redis_url: redis://redis:@redis:6379/
+  redis_url: redis://redis:6379
   minio:
     hash_key: testixik8qdauiab1yiffydimvi72ekq # never change this
-    periodic_callback_ms: false
     access_key_id: codecov-default-key
     secret_access_key: codecov-default-secret
     verify_ssl: false

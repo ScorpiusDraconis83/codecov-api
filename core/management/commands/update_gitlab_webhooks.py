@@ -7,7 +7,6 @@ from shared.config import get_config
 from shared.torngit.exceptions import TorngitClientError, TorngitRefreshTokenFailedError
 from shared.torngit.gitlab import Gitlab
 
-from codecov_auth.models import Owner
 from core.models import Repository
 from services.repo_providers import RepoProviderService
 from utils.repos import get_bot_user
@@ -32,11 +31,8 @@ class Command(BaseCommand):
         )
 
         for repo in repos:
-            print("repoid:", repo.pk)
-
             user = get_bot_user(repo)
             if user is None:
-                print("no bot user")
                 continue
 
             webhook_secret = str(uuid.uuid4())
@@ -64,7 +60,7 @@ class Command(BaseCommand):
                 repo.webhook_secret = webhook_secret
                 repo.save()
             except TorngitClientError as e:
-                print("error making GitLab API call")
-                print(e)
+                print("error making GitLab API call")  # noqa: T201
+                print(e)  # noqa: T201
             except TorngitRefreshTokenFailedError:
-                print("refresh token failed")
+                print("refresh token failed")  # noqa: T201

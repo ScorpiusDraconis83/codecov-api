@@ -68,6 +68,26 @@ class TestConfigType(GraphQLTestHelper, TestCase):
             },
         }
 
+    def test_plan_auto_activate(self):
+        data = self.gql_request("query { config { planAutoActivate }}")
+        assert data == {
+            "config": {
+                "planAutoActivate": None,
+            },
+        }
+
+    @override_settings(IS_ENTERPRISE=True)
+    @patch("services.self_hosted.is_autoactivation_enabled")
+    def test_plan_auto_activate_self_hosted(self, is_autoactivation_enabled):
+        is_autoactivation_enabled.return_value = True
+
+        data = self.gql_request("query { config { planAutoActivate }}")
+        assert data == {
+            "config": {
+                "planAutoActivate": True,
+            },
+        }
+
     def test_seats_limit(self):
         data = self.gql_request("query { config { seatsLimit }}")
         assert data == {
@@ -252,7 +272,7 @@ class TestConfigType(GraphQLTestHelper, TestCase):
         )
         assert data == {
             "config": {
-                "selfHostedLicense": {"expirationDate": None},
+                "selfHostedLicense": None,
             },
         }
 
@@ -277,5 +297,30 @@ class TestConfigType(GraphQLTestHelper, TestCase):
         assert data == {
             "config": {
                 "selfHostedLicense": {"expirationDate": "2020-05-09T00:00:00"},
+            },
+        }
+
+    @override_settings(
+        GITHUB_CLIENT_ID="Github",
+        GITHUB_ENTERPRISE_CLIENT_ID="Github Enterprise",
+        GITLAB_CLIENT_ID="Gitlab",
+        GITLAB_ENTERPRISE_CLIENT_ID="Gitlab Enterprise",
+        BITBUCKET_CLIENT_ID="Bitbucket",
+        BITBUCKET_SERVER_CLIENT_ID="Bitbucket Server",
+        OKTA_OAUTH_CLIENT_ID="Okta",
+        DISABLE_GIT_BASED_LOGIN=True,
+    )
+    def test_sync_providers(self):
+        data = self.gql_request("query { config { syncProviders } }")
+        assert data == {
+            "config": {
+                "syncProviders": [
+                    "GITHUB",
+                    "GITHUB_ENTERPRISE",
+                    "GITLAB",
+                    "GITLAB_ENTERPRISE",
+                    "BITBUCKET",
+                    "BITBUCKET_SERVER",
+                ],
             },
         }

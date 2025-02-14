@@ -1,8 +1,12 @@
 from django.conf import settings
 from rest_framework.exceptions import ErrorDetail
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import CommitFactory, RepositoryFactory
+from billing.helpers import mock_all_plans_and_tiers
 from reports.tests.factories import (
     CommitReportFactory,
     ReportResultsFactory,
@@ -18,10 +22,10 @@ from upload.serializers import (
 
 
 def get_fake_upload():
-    user_with_no_uplaods = OwnerFactory()
-    user_with_uplaods = OwnerFactory()
-    repo = RepositoryFactory.create(author=user_with_uplaods, private=True)
-    public_repo = RepositoryFactory.create(author=user_with_uplaods, private=False)
+    OwnerFactory()
+    user_with_uploads = OwnerFactory()
+    repo = RepositoryFactory.create(author=user_with_uploads, private=True)
+    RepositoryFactory.create(author=user_with_uploads, private=False)
     commit = CommitFactory.create(repository=repo)
     report = CommitReportFactory.create(commit=commit)
 
@@ -42,7 +46,7 @@ def get_fake_upload_with_flags():
 
 def test_serialize_upload(transactional_db, mocker):
     mocker.patch(
-        "services.archive.StorageService.create_presigned_put",
+        "shared.api_archive.archive.StorageService.create_presigned_put",
         return_value="presigned put",
     )
     fake_upload = get_fake_upload()
@@ -59,7 +63,7 @@ def test_serialize_upload(transactional_db, mocker):
 
 def test_upload_serializer_contains_expected_fields_no_flags(transactional_db, mocker):
     mocker.patch(
-        "services.archive.StorageService.create_presigned_put",
+        "shared.api_archive.archive.StorageService.create_presigned_put",
         return_value="presigned put",
     )
     upload = get_fake_upload()
@@ -86,7 +90,7 @@ def test_upload_serializer_contains_expected_fields_with_flags(
     transactional_db, mocker
 ):
     mocker.patch(
-        "services.archive.StorageService.create_presigned_put",
+        "shared.api_archive.archive.StorageService.create_presigned_put",
         return_value="presigned put",
     )
     upload = get_fake_upload_with_flags()
@@ -122,6 +126,25 @@ def test_upload_serializer_null_build_url_empty_flags(transactional_db, mocker):
     assert serializer.is_valid()
 
 
+def test__create_existing_flags_map(transactional_db, mocker):
+    mocker.patch(
+        "shared.api_archive.archive.StorageService.create_presigned_put",
+        return_value="presigned put",
+    )
+    upload = get_fake_upload_with_flags()
+    serializer = UploadSerializer(instance=upload)
+    flags_map = serializer._create_existing_flags_map(
+        upload.report.commit.repository.repoid
+    )
+    upload_flags = upload.flags.all()
+    flag1 = list(filter(lambda flag: flag.flag_name == "flag1", upload_flags))[0]
+    flag2 = list(filter(lambda flag: flag.flag_name == "flag2", upload_flags))[0]
+    assert flags_map == {
+        "flag1": flag1,
+        "flag2": flag2,
+    }
+
+
 def test_commit_serializer_contains_expected_fields(transactional_db, mocker):
     commit = CommitFactory.create()
     serializer = CommitSerializer(commit)
@@ -150,6 +173,34 @@ def test_commit_serializer_contains_expected_fields(transactional_db, mocker):
         "timestamp": commit.timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
     }
     assert serializer.data == expected_data
+
+
+def test_commit_serializer_does_not_duplicate(transactional_db, mocker):
+    mock_all_plans_and_tiers()
+    repository = RepositoryFactory()
+    serializer = CommitSerializer()
+
+    saved_commit1 = serializer.create(
+        {
+            "repository": repository,
+            "commitid": "1234567",
+            "parent_commit_id": "2345678",
+            "pullid": 1,
+            "branch": "test_branch",
+        }
+    )
+
+    saved_commit2 = serializer.create(
+        {
+            "repository": repository,
+            "commitid": "1234567",
+            "parent_commit_id": "2345678",
+            "pullid": 1,
+            "branch": "test_branch",
+        }
+    )
+
+    assert saved_commit1 == saved_commit2
 
 
 def test_invalid_update_data(transactional_db, mocker):

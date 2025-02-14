@@ -1,4 +1,5 @@
 from codecov.commands import exceptions
+from codecov_auth.helpers import current_user_part_of_org
 
 
 class WrappedException:
@@ -53,6 +54,40 @@ def require_authenticated(resolver):
             raise exceptions.Unauthenticated()
 
         return resolver(instance, info, *args, **kwargs)
+
+    return authenticated_resolver
+
+
+def require_part_of_org(resolver):
+    def authenticated_resolver(queried_owner, info, *args, **kwargs):
+        current_user = info.context["request"].user
+        current_owner = info.context["request"].current_owner
+        if (
+            not current_user
+            or not current_user.is_authenticated
+            or not current_owner
+            or not current_user_part_of_org(current_owner, queried_owner)
+        ):
+            return None
+
+        return resolver(queried_owner, info, *args, **kwargs)
+
+    return authenticated_resolver
+
+
+def require_shared_account_or_part_of_org(resolver):
+    def authenticated_resolver(queried_owner, info, *args, **kwargs):
+        current_user = info.context["request"].user
+        if (
+            current_user
+            and current_user.is_authenticated
+            and queried_owner
+            and queried_owner.account
+            and current_user in queried_owner.account.users.all()
+        ):
+            return resolver(queried_owner, info, *args, **kwargs)
+
+        return require_part_of_org(resolver)(queried_owner, info, *args, **kwargs)
 
     return authenticated_resolver
 

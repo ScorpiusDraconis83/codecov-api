@@ -2,18 +2,23 @@ import logging
 import re
 import uuid
 from functools import reduce
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from django.conf import settings
 from django.contrib.auth import login, logout
-from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.contrib.sessions.models import Session as DjangoSession
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.http.request import HttpRequest
 from django.http.response import HttpResponse
 from django.utils import timezone
+from django.utils.timezone import now
 from shared.encryption.token import encode_token
+from shared.events.amplitude import AmplitudeEventPublisher
 from shared.license import LICENSE_ERRORS_MESSAGES, get_current_license
 
-from codecov_auth.models import Owner, OwnerProfile, User
+from codecov_auth.models import Owner, OwnerProfile, Session, User
 from services.analytics import AnalyticsService
 from services.redis_configuration import get_redis_connection
 from services.refresh import RefreshService
@@ -58,14 +63,17 @@ class StateMixin(object):
 
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.redis = get_redis_connection()
-        return super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
+
+    def _session_key(self) -> str:
+        return f"{self.service}_oauth_state"
 
     def _get_key_redis(self, state: str) -> str:
         return f"oauth-state-{state}"
 
-    def _is_matching_cors_domains(self, url_domain) -> bool:
+    def _is_matching_cors_domains(self, url_domain: str) -> bool:
         # make sure the domain is part of the CORS so that's a safe domain to
         # redirect to.
         if url_domain in settings.CORS_ALLOWED_ORIGINS:
@@ -75,7 +83,7 @@ class StateMixin(object):
                 return True
         return False
 
-    def _is_valid_redirection(self, to) -> bool:
+    def _is_valid_redirection(self, to: str) -> bool:
         # make sure the redirect url is from a domain we own
         try:
             url = urlparse(to)
@@ -100,11 +108,25 @@ class StateMixin(object):
         state = uuid.uuid4().hex
         redirection_url = self._generate_redirection_url()
         self.redis.setex(self._get_key_redis(state), 500, redirection_url)
+
+        # By saving the state in a session cookie, we can ensure that the user
+        # following the redirection URL after OAuth authorization is the same
+        # as the user who initiated it. Otherwise, a trickster could generate
+        # a final redirect URL to log into their account, send it to some
+        # victim, and trick the victim into linking their account with the
+        # trickster's.
+        self.request.session[self._session_key()] = state
+
         return state
 
-    def get_redirection_url_from_state(self, state) -> (str, bool):
-        data = self.redis.get(self._get_key_redis(state))
-        if not data:
+    def verify_state(self, state: str) -> bool:
+        state_from_session = self.request.session.get(self._session_key(), None)
+        return state_from_session and state == state_from_session
+
+    def get_redirection_url_from_state(self, state: str) -> tuple[str, bool]:
+        cached_url = self.redis.get(self._get_key_redis(state))
+
+        if not cached_url:
             # we come here after an installation event if the setup url is not set correctly, in that case we usually don't
             # have the state set, because that only happens when users try to login, therefore we should just ignore
             # this case and redirect them to what the setup url should be
@@ -112,14 +134,35 @@ class StateMixin(object):
                 f"{settings.CODECOV_DASHBOARD_URL}/{get_short_service_name(self.service)}",
                 False,
             )
-        return (data.decode("utf-8"), True)
 
-    def remove_state(self, state, delay=0) -> None:
+        # At this point the git provider has redirected the user back to our
+        # site. If the state that the git provider relayed in that redirect
+        # matches the state that we have saved in our session cookie, everything
+        # is fine and we should return the final redirect URL to complete the
+        # login. If we're missing that cookie, or if its state doesn't match up,
+        # we want don't to allow the login.
+        if not self.verify_state(state):
+            log.warning(
+                "Warning: login request is missing state or has disagreeing state"
+            )
+            return (
+                f"{settings.CODECOV_DASHBOARD_URL}",
+                False,
+            )
+
+        # Return the final redirect URL to complete the login.
+        return (cached_url.decode("utf-8"), True)
+
+    def remove_state(self, state: str, delay: int = 0) -> None:
         redirection_url, _ = self.get_redirection_url_from_state(state)
         if delay == 0:
             self.redis.delete(self._get_key_redis(state))
         else:
             self.redis.setex(self._get_key_redis(state), delay, redirection_url)
+
+        session_state = self.request.session.get(self._session_key(), None)
+        if session_state and session_state == state:
+            self.request.session.pop(self._session_key(), None)
 
 
 class LoginMixin(object):
@@ -143,13 +186,17 @@ class LoginMixin(object):
             url += f"/{owner_profile.default_org.username}"
         return url
 
-    def get_or_create_org(self, single_organization):
+    def get_or_create_org(self, single_organization: dict) -> Owner:
         owner, was_created = Owner.objects.get_or_create(
-            service=self.service, service_id=single_organization["id"]
+            service=self.service,
+            service_id=single_organization["id"],
+            defaults={"createstamp": timezone.now()},
         )
         return owner
 
-    def login_owner(self, owner: Owner, request: HttpRequest, response: HttpResponse):
+    def login_owner(
+        self, owner: Owner, request: HttpRequest, response: HttpResponse
+    ) -> None:
         # if there's a currently authenticated user
         if request.user is not None and not request.user.is_anonymous:
             if owner.user is None:
@@ -213,16 +260,17 @@ class LoginMixin(object):
         request.session["current_owner_id"] = owner.pk
         RefreshService().trigger_refresh(owner.ownerid, owner.username)
 
-    def get_and_modify_owner(self, user_dict, request) -> Owner:
+        self.delete_expired_sessions_and_django_sessions(owner)
+        self.store_login_session(owner)
+
+    def get_and_modify_owner(self, user_dict: dict, request: HttpRequest) -> Owner:
         user_orgs = user_dict["orgs"]
         formatted_orgs = [
             dict(username=org["username"], id=str(org["id"])) for org in user_orgs
         ]
 
         self._check_enterprise_organizations_membership(user_dict, formatted_orgs)
-        upserted_orgs = []
-        for org in formatted_orgs:
-            upserted_orgs.append(self.get_or_create_org(org))
+        upserted_orgs = [self.get_or_create_org(org) for org in formatted_orgs]
 
         self._check_user_count_limitations(user_dict["user"])
         owner, is_new_user = self._get_or_create_owner(user_dict, request)
@@ -258,24 +306,26 @@ class LoginMixin(object):
 
         return owner
 
-    def _check_enterprise_organizations_membership(self, user_dict, orgs):
+    def _check_enterprise_organizations_membership(
+        self, user_dict: dict, orgs: list[dict]
+    ) -> None:
         """Checks if a user belongs to the restricted organizations (or teams if GitHub) allowed in settings."""
         if settings.IS_ENTERPRISE and get_config(self.service, "organizations"):
             orgs_in_settings = set(get_config(self.service, "organizations"))
-            orgs_in_user = set(org["username"] for org in orgs)
+            orgs_in_user = {org["username"] for org in orgs}
             if not (orgs_in_settings & orgs_in_user):
                 raise PermissionDenied(
                     "You must be a member of an organization listed in the Codecov Enterprise setup."
                 )
             if get_config(self.service, "teams") and "teams" in user_dict:
                 teams_in_settings = set(get_config(self.service, "teams"))
-                teams_in_user = set([team["name"] for team in user_dict["teams"]])
+                teams_in_user = {team["name"] for team in user_dict["teams"]}
                 if not (teams_in_settings & teams_in_user):
                     raise PermissionDenied(
                         "You must be a member of an allowed team in your organization."
                     )
 
-    def _check_user_count_limitations(self, login_data):
+    def _check_user_count_limitations(self, login_data: dict) -> None:
         if not settings.IS_ENTERPRISE:
             return
         license = get_current_license()
@@ -299,7 +349,7 @@ class LoginMixin(object):
                     owners_with_activated_users = Owner.objects.exclude(
                         plan_activated_users__len=0
                     ).exclude(plan_activated_users__isnull=True)
-                    all_distinct_actiaved_users = reduce(
+                    all_distinct_actiaved_users: set[str] = reduce(
                         lambda acc, curr: set(curr.plan_activated_users) | acc,
                         owners_with_activated_users,
                         set(),
@@ -317,7 +367,9 @@ class LoginMixin(object):
                 if users_on_service_count > license.number_allowed_users:
                     raise PermissionDenied(LICENSE_ERRORS_MESSAGES["users-exceeded"])
 
-    def _get_or_create_owner(self, user_dict, request):
+    def _get_or_create_owner(
+        self, user_dict: dict, request: HttpRequest
+    ) -> tuple[Owner, bool]:
         fields_to_update = ["oauth_token", "private_access", "updatestamp"]
         login_data = user_dict["user"]
         owner, was_created = Owner.objects.get_or_create(
@@ -342,10 +394,21 @@ class LoginMixin(object):
         owner.save(update_fields=fields_to_update)
 
         marketing_tags = self.retrieve_marketing_tags_from_cookie()
+        amplitude = AmplitudeEventPublisher()
         if was_created:
             self.analytics_service.user_signed_up(owner, **marketing_tags)
+            amplitude.publish("User Created", {"user_ownerid": owner.ownerid})
         else:
             self.analytics_service.user_signed_in(owner, **marketing_tags)
+            amplitude.publish("User Logged in", {"user_ownerid": owner.ownerid})
+        orgs = owner.organizations
+        amplitude.publish(
+            "set_orgs",
+            {
+                "user_ownerid": owner.ownerid,
+                "org_ids": orgs if orgs is not None else [],
+            },
+        )
 
         return (owner, was_created)
 
@@ -363,7 +426,7 @@ class LoginMixin(object):
         # remove None values from the dict
         return {k: v for k, v in filtered_params.items() if v is not None}
 
-    def store_to_cookie_utm_tags(self, response) -> None:
+    def store_to_cookie_utm_tags(self, response: HttpResponse) -> None:
         if not settings.IS_ENTERPRISE:
             data = urlencode(self._get_utm_params(self.request.GET))
             response.set_cookie(
@@ -382,3 +445,47 @@ class LoginMixin(object):
             return {k: v[0] for k, v in filtered_params.items()}
         else:
             return {}
+
+    def store_login_session(self, owner: Owner) -> None:
+        # Store user's login session info after logging in
+        http_x_forwarded_for = self.request.META.get("HTTP_X_FORWARDED_FOR")
+        if http_x_forwarded_for:
+            ip = http_x_forwarded_for.split(",")[0]
+        else:
+            ip = self.request.META.get("REMOTE_ADDR")
+
+        login_session = DjangoSession.objects.filter(
+            session_key=self.request.session.session_key
+        ).first()
+
+        Session.objects.create(
+            lastseen=timezone.now(),
+            useragent=self.request.META.get("HTTP_USER_AGENT"),
+            ip=ip,
+            login_session=login_session,
+            type=Session.SessionType.LOGIN,
+            owner=owner,
+        )
+
+    def delete_expired_sessions_and_django_sessions(self, owner: Owner) -> None:
+        """
+        This function deletes expired login sessions for a given owner
+        """
+        with transaction.atomic():
+            # Get the primary keys of expired DjangoSessions for the given owner
+            expired_sessions = Session.objects.filter(
+                owner=owner,
+                type="login",
+                login_session__isnull=False,
+                login_session__expire_date__lt=now(),
+            )
+
+            # Delete the rows in the Session table using sessionid
+            Session.objects.filter(
+                sessionid__in=[es.sessionid for es in expired_sessions]
+            ).delete()
+
+            # Delete the rows in the DjangoSession table using the extracted keys
+            DjangoSession.objects.filter(
+                session_key__in=[es.login_session for es in expired_sessions]
+            ).delete()

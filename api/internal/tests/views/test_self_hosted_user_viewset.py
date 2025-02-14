@@ -1,16 +1,16 @@
 from unittest.mock import patch
 
-from django.test import TransactionTestCase, override_settings
+from django.test import TestCase, override_settings
 from rest_framework.reverse import reverse
+from shared.django_apps.core.tests.factories import OwnerFactory
 
 from codecov_auth.models import Owner
-from codecov_auth.tests.factories import OwnerFactory
 from services.self_hosted import activate_owner, is_activated_owner
 from utils.test_utils import APIClient
 
 
 @override_settings(IS_ENTERPRISE=True, ROOT_URLCONF="api.internal.enterprise_urls")
-class UserViewsetUnauthenticatedTestCase(TransactionTestCase):
+class UserViewsetUnauthenticatedTestCase(TestCase):
     def test_list_users(self):
         res = self.client.get(reverse("selfhosted-users-list"))
         # not authenticated
@@ -18,7 +18,7 @@ class UserViewsetUnauthenticatedTestCase(TransactionTestCase):
 
 
 @override_settings(IS_ENTERPRISE=True, ROOT_URLCONF="api.internal.enterprise_urls")
-class UserViewsetTestCase(TransactionTestCase):
+class UserViewsetTestCase(TestCase):
     def setUp(self):
         self.owner = OwnerFactory()
         self.current_owner = OwnerFactory(organizations=[self.owner.ownerid])
@@ -86,10 +86,8 @@ class UserViewsetAdminTestCase(UserViewsetTestCase):
     def test_list_users(self, admin_owners):
         admin_owners.return_value = Owner.objects.filter(pk__in=[self.current_owner.pk])
 
-        other_owner = OwnerFactory()
-        other_other_owner = OwnerFactory(
-            oauth_token=None, organizations=[self.owner.ownerid]
-        )
+        OwnerFactory()
+        OwnerFactory(oauth_token=None, organizations=[self.owner.ownerid])
         activated_owner = OwnerFactory(
             oauth_token=None,
             organizations=None,
@@ -128,7 +126,7 @@ class UserViewsetAdminTestCase(UserViewsetTestCase):
     def test_list_users_filter_admin(self, admin_owners):
         admin_owners.return_value = Owner.objects.filter(pk__in=[self.current_owner.pk])
 
-        other_owner = OwnerFactory()
+        OwnerFactory()
 
         res = self.client.get(reverse("selfhosted-users-list"), {"is_admin": True})
         assert res.status_code == 200

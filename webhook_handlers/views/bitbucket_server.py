@@ -1,14 +1,11 @@
 import logging
 
 from django.shortcuts import get_object_or_404
-from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from shared.helpers.yaml import walk
 
-from codecov_auth.models import Owner
-from core.models import Branch, Commit, Pull, PullStates, Repository
+from core.models import Branch, Pull, PullStates, Repository
 from services.task import TaskService
 from webhook_handlers.constants import (
     BitbucketServerHTTPHeaders,
@@ -16,12 +13,30 @@ from webhook_handlers.constants import (
     WebhookHandlerErrorMessages,
 )
 
+from . import WEBHOOKS_ERRORED, WEBHOOKS_RECEIVED
+
 log = logging.getLogger(__name__)
 
 
 class BitbucketServerWebhookHandler(APIView):
     # https://confluence.atlassian.com/bitbucketserver/event-payload-938025882.html
     permission_classes = [AllowAny]
+    service_name = "bitbucket_server"
+
+    def _inc_recv(self):
+        event, _, action = self.event.partition(":")
+        WEBHOOKS_RECEIVED.labels(
+            service=self.service_name, event=event, action=action
+        ).inc()
+
+    def _inc_err(self, reason: str):
+        event, _, action = self.event.partition(":")
+        WEBHOOKS_ERRORED.labels(
+            service=self.service_name,
+            event=event,
+            action=action,
+            error_reason=reason,
+        ).inc()
 
     def _get_repo(self, event, body):
         if event.startswith("repo:"):
@@ -29,9 +44,13 @@ class BitbucketServerWebhookHandler(APIView):
         elif event.startswith("pr:"):
             repo_id = body["pullRequest"]["toRef"]["repository"]["id"]
 
-        return get_object_or_404(
-            Repository, author__service="bitbucket_server", service_id=repo_id
-        )
+        try:
+            return get_object_or_404(
+                Repository, author__service="bitbucket_server", service_id=repo_id
+            )
+        except Exception as e:
+            self._inc_err("repo_not_found")
+            raise e
 
     def post(self, request, *args, **kwargs):
         self.event = self.request.META.get(BitbucketServerHTTPHeaders.EVENT)
@@ -39,6 +58,7 @@ class BitbucketServerWebhookHandler(APIView):
 
         repo = self._get_repo(self.event, self.request.data)
         if not repo.active:
+            self._inc_err("repo_not_active")
             return Response(data=WebhookHandlerErrorMessages.SKIP_NOT_ACTIVE)
 
         log.info(
@@ -47,15 +67,19 @@ class BitbucketServerWebhookHandler(APIView):
         )
 
         if self.event == BitbucketServerWebhookEvents.PULL_REQUEST_CREATED:
+            self._inc_recv()
             return self._handle_pull_request_created_event(repo)
         elif self.event in (
             BitbucketServerWebhookEvents.PULL_REQUEST_MERGED,
             BitbucketServerWebhookEvents.PULL_REQUEST_REJECTED,
         ):
+            self._inc_recv()
             return self._handle_pull_request_state_change(repo)
         elif self.event == BitbucketServerWebhookEvents.REPO_REFS_CHANGED:
+            self._inc_recv()
             return self._handle_repo_refs_change(repo)
 
+        self._inc_err("unhandled_event")
         return Response()
 
     def _handle_pull_request_created_event(self, repo):

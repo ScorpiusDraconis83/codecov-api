@@ -1,13 +1,15 @@
+from typing import Any
+
 from django.http import HttpResponse
 from rest_framework import status
+from rest_framework.request import Request
 from rest_framework.response import Response
 
 
 class GraphBadgeAPIMixin(object):
-    def get(self, request, *args, **kwargs):
-
+    def get(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         ext = self.kwargs.get("ext")
-        if not ext in self.extensions:
+        if ext not in self.extensions:
             return Response(
                 {
                     "detail": f"File extension should be one of [ {' || '.join(self.extensions)} ]"
@@ -28,8 +30,8 @@ class GraphBadgeAPIMixin(object):
             response["Content-Type"] = "image/svg+xml"
             response["Pragma"] = "no-cache"
             response["Expires"] = "0"
-            response[
-                "Access-Control-Expose-Headers"
-            ] = "Content-Type, Cache-Control, Expires, Etag, Last-Modified"
+            response["Access-Control-Expose-Headers"] = (
+                "Content-Type, Cache-Control, Expires, Etag, Last-Modified"
+            )
             response["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
         return response

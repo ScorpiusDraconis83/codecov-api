@@ -1,7 +1,6 @@
 import os
-from urllib.parse import urlparse
 
-from utils.config import get_config, get_settings_module
+from utils.config import get_config
 
 from .settings_base import *
 
@@ -71,3 +70,7 @@ ADMINS_LIST = get_config("setup", "admins", default=[])
 CSRF_TRUSTED_ORIGINS = [
     get_config("setup", "trusted_origin", default=DEFAULT_TRUSTED_ORIGIN)
 ]
+
+GUEST_ACCESS = get_config("setup", "guest_access", default=True)
+
+SHELTER_ENABLED = get_config("setup", "shelter_enabled", default=False)

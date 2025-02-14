@@ -3,12 +3,12 @@ from uuid import uuid4
 from django.urls import reverse
 from rest_framework.test import APIClient
 from shared.celery_config import label_analysis_task_name
-
-from core.tests.factories import (
+from shared.django_apps.core.tests.factories import (
     CommitFactory,
     RepositoryFactory,
     RepositoryTokenFactory,
 )
+
 from labelanalysis.models import (
     LabelAnalysisProcessingError,
     LabelAnalysisRequest,
@@ -441,14 +441,6 @@ def test_simple_label_analysis_put_labels_wrong_base_return_404(db, mocker):
     produced_object = LabelAnalysisRequest.objects.get(head_commit=commit)
     assert produced_object == label_analysis
     assert produced_object.requested_labels is None
-    expected_response_json = {
-        "base_commit": base_commit.commitid,
-        "head_commit": commit.commitid,
-        "requested_labels": ["label_1", "label_2", "label_3"],
-        "result": None,
-        "state": "created",
-        "external_id": str(produced_object.external_id),
-    }
     patch_url = reverse(
         "view_label_analysis", kwargs=dict(external_id=produced_object.external_id)
     )

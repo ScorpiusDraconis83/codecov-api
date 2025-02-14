@@ -1,6 +1,9 @@
 from django.test import TransactionTestCase
+from shared.django_apps.codecov_auth.tests.factories import (
+    OwnerFactory,
+    UserTokenFactory,
+)
 
-from codecov_auth.tests.factories import OwnerFactory, UserTokenFactory
 from graphql_api.tests.helper import GraphQLTestHelper
 
 query = """
@@ -28,6 +31,6 @@ class RevokeUserTokenTestCase(GraphQLTestHelper, TransactionTestCase):
         data = self.gql_request(
             query, owner=self.owner, variables={"input": {"tokenid": tokenid}}
         )
-        assert data["revokeUserToken"] == None
+        assert data["revokeUserToken"] is None
         deleted_user_token = self.owner.user_tokens.filter(external_id=tokenid).first()
         assert deleted_user_token is None

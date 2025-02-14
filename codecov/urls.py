@@ -24,8 +24,18 @@ urlpatterns = [
     path(f"{settings.DJANGO_ADMIN_URL}/", admin.site.urls),
     path("staticanalysis/", include("staticanalysis.urls")),
     path("labels/", include("labelanalysis.urls")),
-    re_path(r"^redirect_app", views.redirect_app),
+    path(
+        "admin-repository-autocomplete/",
+        views.RepositoryAutoCompleteSearch.as_view(),
+        name="admin-repository-autocomplete",
+    ),
+    path(
+        "admin-owner-autocomplete/",
+        views.OwnerAutoCompleteSearch.as_view(),
+        name="admin-owner-autocomplete",
+    ),
     # /monitoring/metrics will be a public route unless you take steps at a
     # higher level to null-route or redirect it.
     path("monitoring/", include("django_prometheus.urls")),
+    path("gen_ai/", include("api.gen_ai.urls")),
 ]

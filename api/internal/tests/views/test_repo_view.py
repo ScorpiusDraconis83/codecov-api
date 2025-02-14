@@ -1,21 +1,18 @@
-import json
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from django.test import override_settings
 from django.utils import timezone
 from rest_framework.reverse import reverse
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    RepositoryFactory,
+)
 from shared.torngit.exceptions import TorngitClientGeneralError
 
 from api.internal.commit.serializers import CommitTotalsSerializer
 from api.internal.tests.test_utils import GetAdminProviderAdapter
 from codecov.tests.base_test import InternalAPITest
-from codecov_auth.tests.factories import OwnerFactory
 from core.models import Repository
-from core.tests.factories import (
-    CommitFactory,
-    CommitWithReportFactory,
-    RepositoryFactory,
-)
 from utils.test_utils import Client
 
 
@@ -56,38 +53,6 @@ class RepositoryViewSetTestSuite(InternalAPITest):
                 "repo_name": self.repo.name,
             }
         return self.client.delete(reverse("repos-detail", kwargs=kwargs))
-
-    def _regenerate_upload_token(self, kwargs={}):
-        if kwargs == {}:
-            kwargs = {
-                "service": self.org.service,
-                "owner_username": self.org.username,
-                "repo_name": self.repo.name,
-            }
-        return self.client.patch(
-            reverse("repos-regenerate-upload-token", kwargs=kwargs)
-        )
-
-    def _erase(self, kwargs={}):
-        if kwargs == {}:
-            kwargs = {
-                "service": self.org.service,
-                "owner_username": self.org.username,
-                "repo_name": self.repo.name,
-            }
-        return self.client.patch(reverse("repos-erase", kwargs=kwargs))
-
-    def _encode(self, kwargs, data):
-        return self.client.post(reverse("repos-encode", kwargs=kwargs), data=data)
-
-    def _reset_webhook(self, kwargs={}):
-        if kwargs == {}:
-            kwargs = {
-                "service": self.org.service,
-                "owner_username": self.org.username,
-                "repo_name": self.repo.name,
-            }
-        return self.client.put(reverse("repos-reset-webhook", kwargs=kwargs))
 
 
 class TestRepositoryViewSetList(RepositoryViewSetTestSuite):
@@ -334,7 +299,7 @@ class TestRepositoryViewSetList(RepositoryViewSetTestSuite):
         )
 
     def test_get_inactive_repos(self):
-        new_repo = RepositoryFactory(author=self.org, name="C", private=False)
+        RepositoryFactory(author=self.org, name="C", private=False)
 
         response = self._list(query_params={"active": False})
         self.assertEqual(response.status_code, 200)
@@ -345,7 +310,7 @@ class TestRepositoryViewSetList(RepositoryViewSetTestSuite):
         )
 
     def test_get_all_repos(self):
-        new_repo = RepositoryFactory(author=self.org, name="C", private=False)
+        RepositoryFactory(author=self.org, name="C", private=False)
 
         response = self._list()
         self.assertEqual(response.status_code, 200)
@@ -356,7 +321,7 @@ class TestRepositoryViewSetList(RepositoryViewSetTestSuite):
         )
 
     def test_get_all_repos_by_name(self):
-        new_repo = RepositoryFactory(author=self.org, name="C", private=False)
+        RepositoryFactory(author=self.org, name="C", private=False)
 
         response = self._list(query_params={"names": ["A", "B"]})
         self.assertEqual(response.status_code, 200)
@@ -686,39 +651,6 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
         assert response.data["detail"] == "User not activated"
         assert Repository.objects.filter(name="repo1").exists()
 
-    def test_regenerate_upload_token_with_permissions_succeeds(
-        self, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        old_upload_token = self.repo.upload_token
-
-        response = self._regenerate_upload_token()
-
-        assert response.status_code == 200
-        self.repo.refresh_from_db()
-        assert str(self.repo.upload_token) == response.data["upload_token"]
-        assert str(self.repo.upload_token) != old_upload_token
-
-    def test_regenerate_upload_token_without_permissions_returns_403(
-        self, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = False, False
-        response = self._regenerate_upload_token()
-        self.assertEqual(response.status_code, 403)
-
-    def test_regenerate_upload_token_as_inactive_user_returns_403(
-        self, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        self.org.plan = "users-inappy"
-        self.org.plan_auto_activate = False
-        self.org.save()
-
-        response = self._regenerate_upload_token()
-
-        assert response.status_code == 403
-        assert response.data["detail"] == "User not activated"
-
     def test_update_default_branch_with_permissions_succeeds(
         self, mocked_get_permissions
     ):
@@ -740,92 +672,9 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
         self, mocked_get_permissions
     ):
         mocked_get_permissions.return_value = True, False
-        new_default_branch = "no_write_permissions"
 
         response = self._update(data={"branch": "dev"})
         self.assertEqual(response.status_code, 403)
-
-    @patch("services.task.TaskService.delete_timeseries")
-    @patch("services.task.TaskService.flush_repo")
-    def test_erase_triggers_task(
-        self, mocked_flush_repo, mocked_delete_timeseries, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        self.org.admins = [self.current_owner.ownerid]
-        self.org.save()
-
-        response = self._erase()
-        assert response.status_code == 200
-
-        mocked_flush_repo.assert_called_once_with(repository_id=self.repo.pk)
-        mocked_delete_timeseries.assert_called_once_with(repository_id=self.repo.pk)
-
-    @patch("api.shared.permissions.get_provider")
-    def test_erase_without_admin_rights_returns_403(
-        self, mocked_get_provider, mocked_get_permissions
-    ):
-        mocked_get_provider.return_value = GetAdminProviderAdapter()
-        mocked_get_permissions.return_value = True, True
-
-        assert self.current_owner.ownerid not in self.org.admins
-
-        response = self._erase()
-        assert response.status_code == 403
-
-    def test_erase_as_inactive_user_returns_403(self, mocked_get_permissions):
-        mocked_get_permissions.return_value = True, True
-        self.org.plan = "users-inappy"
-        self.org.plan_auto_activate = False
-        self.org.admins = [self.current_owner.ownerid]
-        self.org.save()
-
-        response = self._erase()
-
-        assert response.status_code == 403
-        assert response.data["detail"] == "User not activated"
-
-    @override_settings(IS_ENTERPRISE=True)
-    @patch("api.shared.repo.mixins.RepositoryViewSetMixin.get_object")
-    @patch("services.self_hosted.get_config")
-    @patch("services.task.TaskService.delete_timeseries")
-    @patch("services.task.TaskService.flush_repo")
-    def test_erase_as_admin_self_hosted(
-        self,
-        mocked_flush_repo,
-        mocked_delete_timeseries,
-        mocked_get_config,
-        mocked_get_object,
-        mocked_get_permissions,
-    ):
-        mocked_get_permissions.return_value = True, True
-        self.org.admins = [self.current_owner.ownerid]
-        self.org.save()
-
-        mocked_get_config.return_value = [
-            {"service": "github", "username": "codecov-user"},
-        ]
-        mocked_get_object.return_value = self.repo
-
-        response = self._erase()
-        assert response.status_code == 200
-
-        mocked_flush_repo.assert_called_once_with(repository_id=self.repo.pk)
-        mocked_delete_timeseries.assert_called_once_with(repository_id=self.repo.pk)
-
-    @override_settings(IS_ENTERPRISE=True)
-    @patch("services.self_hosted.get_config")
-    @patch("api.shared.permissions.get_provider")
-    def test_erase_as_non_admin_self_hosted(
-        self, mocked_get_provider, mocked_get_config, mocked_get_permissions
-    ):
-        mocked_get_provider.return_value = GetAdminProviderAdapter()
-        mocked_get_config.return_value = [
-            {"service": "github", "username": "someone-else"},
-        ]
-        mocked_get_permissions.return_value = True, True
-
-        response = self._erase()
-        assert response.status_code == 403
 
     def test_retrieve_returns_yaml(self, mocked_get_permissions):
         mocked_get_permissions.return_value = True, False
@@ -851,70 +700,12 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
                 name=str(i) + "random", author=self.org, private=True, active=True
             )
 
-        inactive_repo = RepositoryFactory(author=self.org, private=True, active=False)
+        RepositoryFactory(author=self.org, private=True, active=False)
 
         activation_data = {"active": True}
         response = self._update(data=activation_data)
 
         assert response.status_code == 403
-
-    def test_encode_returns_200_on_success(self, mocked_get_permissions):
-        mocked_get_permissions.return_value = True, True
-
-        to_encode = {"value": "hjrok"}
-        response = self._encode(
-            kwargs={
-                "service": self.org.service,
-                "owner_username": self.org.username,
-                "repo_name": self.repo.name,
-            },
-            data=to_encode,
-        )
-
-        assert response.status_code == 201
-
-    @patch("api.internal.repo.views.encode_secret_string")
-    def test_encode_returns_encoded_string_on_success(
-        self, encoder_mock, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        encrypted_string = "string:encrypted string"
-        encoder_mock.return_value = encrypted_string
-
-        to_encode = {"value": "hjrok"}
-        response = self._encode(
-            kwargs={
-                "service": self.org.service,
-                "owner_username": self.org.username,
-                "repo_name": self.repo.name,
-            },
-            data=to_encode,
-        )
-
-        assert response.status_code == 201
-        assert response.data["value"] == encrypted_string
-
-    def test_encode_secret_string_encodes_with_right_key(self, _):
-        from api.internal.repo.utils import encode_secret_string
-
-        string_arg = "hi there"
-        to_encode = "/".join(
-            (  # this is the format expected by the key
-                self.org.service,
-                self.org.service_id,
-                self.repo.service_id,
-                string_arg,
-            )
-        )
-
-        from shared.encryption.yaml_secret import yaml_secret_encryptor
-
-        check_encryptor = yaml_secret_encryptor
-
-        encoded = encode_secret_string(to_encode)
-
-        # we slice to take off the word "secret" prepended by the util
-        assert check_encryptor.decode(encoded[7:]) == to_encode
 
     def test_repo_bot_returns_username_if_bot_not_null(self, mocked_get_permissions):
         mocked_get_permissions.return_value = True, True
@@ -935,100 +726,30 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
         response = self._retrieve()
         assert response.status_code == 200
 
-    @patch("api.internal.repo.views.delete_webhook_on_provider")
-    @patch("api.internal.repo.views.create_webhook_on_provider")
-    def test_reset_webhook_unsets_original_hookid_and_sets_new_if_hookid_exists(
-        self, create_webhook_mock, delete_webhook_mock, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-
-        old_webhook_id, new_webhook_id = "123", "456"
-
-        self.repo.hookid = old_webhook_id
-        self.repo.save()
-
-        create_webhook_mock.return_value = new_webhook_id
-
-        response = self._reset_webhook()
-
-        assert response.status_code == 200
-
-        self.repo.refresh_from_db()
-
-        assert self.repo.hookid == new_webhook_id
-
-    @patch("api.internal.repo.views.delete_webhook_on_provider")
-    @patch("api.internal.repo.views.create_webhook_on_provider")
-    def test_reset_webhook_doesnt_delete_if_no_hookid(
-        self, create_webhook_mock, delete_webhook_mock, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        create_webhook_mock.return_value = "irrelevant"
-
-        # Make delete function throw exception, so if it's called this test fails
-        delete_webhook_mock.side_effect = Exception(
-            "Attempted to delete nonexistent webhook"
-        )
-
-        response = self._reset_webhook()
-
-    @patch("api.internal.repo.views.delete_webhook_on_provider")
-    @patch("api.internal.repo.views.create_webhook_on_provider")
-    def test_reset_webhook_creates_new_webhook_even_if_no_hookid(
-        self, create_webhook_mock, delete_webhook_mock, mocked_get_permissions
-    ):
-        mocked_get_permissions.return_value = True, True
-        new_webhook_id = "123"
-        create_webhook_mock.return_value = new_webhook_id
-
-        response = self._reset_webhook()
-
-        self.repo.refresh_from_db()
-        assert self.repo.hookid == new_webhook_id
-
-    @patch("api.internal.repo.views.delete_webhook_on_provider")
-    @patch("api.internal.repo.views.create_webhook_on_provider")
-    def test_reset_webhook_returns_correct_code_and_response_if_TorgitClientError_raised(
-        self, create_webhook_mock, delete_webhook_mock, mocked_get_permissions
-    ):
-        code = 403
-        message = "No can do, buddy"
-        mocked_get_permissions.return_value = True, True
-        create_webhook_mock.side_effect = TorngitClientGeneralError(
-            code, response_data=None, message=message
-        )
-
-        response = self._reset_webhook()
-
-        assert response.status_code == code
-        assert response.data == {"detail": message}
-
-    @patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
+    @patch("shared.api_archive.archive.ArchiveService.read_chunks", lambda obj, _: "")
     def test_retrieve_returns_latest_commit_data(self, mocked_get_permissions):
         self.maxDiff = None
         mocked_get_permissions.return_value = True, True
-        commit = CommitWithReportFactory(
+        commit = CommitFactory(
             repository=self.repo,
+            _report={
+                "files": {
+                    "test_file_1.py": [
+                        2,
+                        [1, 10, 8, 2, 5, "80.00000", 6, 7, 9, 8, 20, 40, 13],
+                        [[0, 10, 8, 2, 0, "80.00000", 0, 0, 0, 0, 0, 0, 0]],
+                        [0, 2, 1, 1, 0, "50.00000", 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                    "test_file_2.py": [
+                        0,
+                        [1, 3, 2, 1, 0, "66.66667", 0, 0, 0, 0, 0, 0, 0],
+                        [[0, 3, 2, 1, 0, "66.66667", 0, 0, 0, 0, 0, 0, 0]],
+                        None,
+                    ],
+                },
+                "sessions": {},
+            },
         )
-
-        report_details = commit.reports.first().reportdetails
-        report_details._files_array = [
-            {
-                "filename": "test_file_1.py",
-                "file_index": 2,
-                "file_totals": [1, 10, 8, 2, 5, "80.00000", 6, 7, 9, 8, 20, 40, 13],
-                "session_totals": [[0, 10, 8, 2, 0, "80.00000", 0, 0, 0, 0, 0, 0, 0]],
-                "diff_totals": [0, 2, 1, 1, 0, "50.00000", 0, 0, 0, 0, 0, 0, 0],
-            },
-            {
-                "filename": "test_file_2.py",
-                "file_index": 0,
-                "file_totals": [1, 3, 2, 1, 0, "66.66667", 0, 0, 0, 0, 0, 0, 0],
-                "session_totals": [[0, 3, 2, 1, 0, "66.66667", 0, 0, 0, 0, 0, 0, 0]],
-                "diff_totals": None,
-            },
-        ]
-        report_details.save()
 
         from api.internal.commit.serializers import CommitWithFileLevelReportSerializer
 
@@ -1040,7 +761,7 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
             response.data["latest_commit"]["report"]["totals"]
             == expected_commit_payload["report"]["totals"]
         )
-        self.assertEquals(
+        self.assertEqual(
             response.data["latest_commit"]["report"]["files"],
             [
                 {
@@ -1069,7 +790,7 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
                         "hits": 2,
                         "misses": 1,
                         "partials": 0,
-                        "coverage": 66.67,
+                        "coverage": 66.66,
                         "branches": 0,
                         "methods": 0,
                         "sessions": 0,
@@ -1082,184 +803,41 @@ class TestRepositoryViewSetDetailActions(RepositoryViewSetTestSuite):
             ],
         )
 
-    @patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
-    @patch("utils.model_utils.ArchiveService")
-    def test_retrieve_returns_latest_commit_data_report_details_from_storage(
-        self, mocker_archive_service, mocked_get_permissions
-    ):
-        self.maxDiff = None
-        mocked_get_permissions.return_value = True, True
-        files_array_storage_path = "https://storage/path/to/details/files_array.json"
-        commit = CommitWithReportFactory(
-            repository=self.repo,
-        )
-
-        def side_effect(path, *args, **kwargs):
-            if path == files_array_storage_path:
-                return json.dumps(
-                    [
-                        {
-                            "filename": "test_file_1.py",
-                            "file_index": 2,
-                            "file_totals": [
-                                1,
-                                10,
-                                8,
-                                2,
-                                5,
-                                "80.00000",
-                                6,
-                                7,
-                                9,
-                                8,
-                                20,
-                                40,
-                                13,
-                            ],
-                            "session_totals": [
-                                [0, 10, 8, 2, 0, "80.00000", 0, 0, 0, 0, 0, 0, 0]
-                            ],
-                            "diff_totals": [
-                                0,
-                                2,
-                                1,
-                                1,
-                                0,
-                                "50.00000",
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                        },
-                        {
-                            "filename": "test_file_2.py",
-                            "file_index": 0,
-                            "file_totals": [
-                                1,
-                                3,
-                                2,
-                                1,
-                                0,
-                                "66.66667",
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                            "session_totals": [
-                                [0, 3, 2, 1, 0, "66.66667", 0, 0, 0, 0, 0, 0, 0]
-                            ],
-                            "diff_totals": None,
-                        },
-                    ]
-                )
-            else:
-                return ""
-
-        mock_read_file = Mock(side_effect=side_effect)
-        mocker_archive_service.return_value = Mock(read_file=mock_read_file)
-        report_details = commit.reports.first().reportdetails
-        report_details._files_array = None
-        report_details._files_array_storage_path = files_array_storage_path
-        report_details.save()
-
-        from api.internal.commit.serializers import CommitWithFileLevelReportSerializer
-
-        expected_commit_payload = CommitWithFileLevelReportSerializer(commit).data
-        mocker_archive_service.assert_called_with(repository=commit.repository)
-        mock_read_file.assert_called_with(files_array_storage_path)
-        response = self._retrieve()
-        assert response.status_code == 200
-        assert (
-            response.data["latest_commit"]["report"]["totals"]
-            == expected_commit_payload["report"]["totals"]
-        )
-        self.assertEquals(
-            response.data["latest_commit"]["report"]["files"],
-            [
-                {
-                    "name": "test_file_1.py",
-                    "totals": {
-                        "files": 1,
-                        "lines": 10,
-                        "hits": 8,
-                        "misses": 2,
-                        "partials": 5,
-                        "coverage": 80.0,
-                        "branches": 6,
-                        "methods": 7,
-                        "sessions": 8,
-                        "complexity": 20.0,
-                        "complexity_total": 40.0,
-                        "complexity_ratio": 50.0,
-                        "diff": 0,
-                    },
-                },
-                {
-                    "name": "test_file_2.py",
-                    "totals": {
-                        "files": 1,
-                        "lines": 3,
-                        "hits": 2,
-                        "misses": 1,
-                        "partials": 0,
-                        "coverage": 66.67,
-                        "branches": 0,
-                        "methods": 0,
-                        "sessions": 0,
-                        "complexity": 0,
-                        "complexity_total": 0,
-                        "complexity_ratio": 0,
-                        "diff": 0,
-                    },
-                },
-            ],
-        )
-
-    @patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
+    @patch("shared.api_archive.archive.ArchiveService.read_chunks", lambda obj, _: "")
     def test_retrieve_returns_latest_commit_of_default_branch_if_branch_not_specified(
         self, mocked_get_permissions
     ):
         mocked_get_permissions.return_value = True, True
 
-        commit = CommitWithReportFactory(repository=self.repo)
-        more_recent_commit = CommitWithReportFactory(
-            repository=self.repo, branch="other-branch"
-        )
+        commit = CommitFactory(repository=self.repo)
+        more_recent_commit = CommitFactory(repository=self.repo, branch="other-branch")
 
         response = self._retrieve()
 
         assert response.data["latest_commit"]["commitid"] == commit.commitid
         assert response.data["latest_commit"]["commitid"] != more_recent_commit.commitid
 
-    @patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
+    @patch("shared.api_archive.archive.ArchiveService.read_chunks", lambda obj, _: "")
     def test_retrieve_accepts_branch_query_param_to_specify_latest_commit(
         self, mocked_get_permissions
     ):
         mocked_get_permissions.return_value = True, True
 
-        commit = CommitWithReportFactory(repository=self.repo, branch="other-branch")
-        more_recent_commit = CommitWithReportFactory(repository=self.repo)
+        commit = CommitFactory(repository=self.repo, branch="other-branch")
+        more_recent_commit = CommitFactory(repository=self.repo)
 
         response = self._retrieve(data={"branch": "other-branch"})
 
         assert response.data["latest_commit"]["commitid"] == commit.commitid
         assert response.data["latest_commit"]["commitid"] != more_recent_commit.commitid
 
-    @patch("services.archive.ArchiveService.read_chunks", lambda obj, _: "")
+    @patch("shared.api_archive.archive.ArchiveService.read_chunks", lambda obj, _: "")
     def test_latest_commit_is_none_if_dne(self, mocked_get_permissions):
         mocked_get_permissions.return_value = True, True
 
         response = self._retrieve()
 
-        assert response.data["latest_commit"] == None
+        assert response.data["latest_commit"] is None
 
     def test_can_retrieve_repo_name_containing_dot(self, mocked_get_permissions):
         mocked_get_permissions.return_value = True, True

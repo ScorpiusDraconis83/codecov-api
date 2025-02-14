@@ -1,11 +1,15 @@
 import json
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 from rest_framework.test import APIClient, APITestCase
+from shared.django_apps.core.tests.factories import (
+    CommitFactory,
+    OwnerFactory,
+    PullFactory,
+    RepositoryFactory,
+)
 
-from codecov_auth.tests.factories import OwnerFactory
 from core.models import Pull
-from core.tests.factories import CommitFactory, PullFactory, RepositoryFactory
 
 
 class PullViewSetTests(APITestCase):
@@ -129,3 +133,10 @@ class PullViewSetTests(APITestCase):
         )
         self.assertEqual(response.status_code, 405)
         assert not pulls_sync_mock.called
+
+    def test_get_pull_no_pullid_provided(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.repo.upload_token)
+        response = self.client.get("/api/github/codecov/testRepoName/pulls/abc")
+        self.assertEqual(response.status_code, 400)
+        content = json.loads(response.content.decode())
+        self.assertEqual(content["pullid"], ["A valid integer is required."])

@@ -1,11 +1,12 @@
 import pytest
-from asgiref.sync import async_to_sync
-from django.contrib.auth.models import AnonymousUser
 from django.test import TransactionTestCase
+from shared.django_apps.core.tests.factories import (
+    OwnerFactory,
+    RepositoryFactory,
+    RepositoryTokenFactory,
+)
 
-from codecov.commands.exceptions import Unauthenticated, ValidationError
-from codecov_auth.tests.factories import OwnerFactory
-from core.tests.factories import RepositoryFactory, RepositoryTokenFactory
+from codecov.commands.exceptions import ValidationError
 
 from ..regenerate_repository_token import RegenerateRepositoryTokenInteractor
 

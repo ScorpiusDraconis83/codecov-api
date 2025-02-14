@@ -1,4 +1,3 @@
-from contextlib import suppress
 from json import dumps, loads
 
 from celery.result import result_from_tuple
@@ -39,11 +38,12 @@ class RefreshService(object):
         sync_teams=True,
         sync_repos=True,
         using_integration=False,
+        manual_trigger=False,
     ):
         if self.is_refreshing(ownerid):
             return
         resp = self.task_service.refresh(
-            ownerid, username, sync_repos, sync_teams, using_integration
+            ownerid, username, sync_repos, sync_teams, using_integration, manual_trigger
         )
         # store in redis the task data to be used for `is_refreshing` logic
         self.redis.setex(self._get_key_name(ownerid), 900, dumps(resp.as_tuple()))
